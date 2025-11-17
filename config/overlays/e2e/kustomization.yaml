@@ -12,6 +12,9 @@ resources:
 - ./re-inspection
 - ./upgrade-bmo
 - ./upgrade-ironic
+- ./multi-bmh
+- ./multi-claim
+- ./cluster-role.yaml
 
 components:
 - ../../components/namespace-scoped
