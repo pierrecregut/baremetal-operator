@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"runtime"
 	"slices"
@@ -158,6 +159,11 @@ func (r *BareMetalHostReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		return ctrl.Result{}, fmt.Errorf("could not update hardware details: %w", err)
 	} else if hwdUpdated {
 		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// hardwaredata metadata must reflect baremetalhost metadata
+	if err := r.updateHardwareData(ctx, host); err != nil {
+		return ctrl.Result{}, fmt.Errorf("could not synchronize hardware data metadata: %s", err)
 	}
 
 	// NOTE(dhellmann): Handle a few steps outside of the phase
@@ -2429,4 +2435,59 @@ func (r *BareMetalHostReconciler) reconcileHostData(ctx context.Context, host *m
 		return ctrl.Result{Requeue: true}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *BareMetalHostReconciler) updateHardwareData(ctx context.Context, host *metal3api.BareMetalHost) error {
+	hardwareData := &metal3api.HardwareData{}
+	hardwareDataKey := client.ObjectKey{
+		Name:      host.Name,
+		Namespace: host.Namespace,
+	}
+	err := r.Client.Get(ctx, hardwareDataKey, hardwareData)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("error loading HardwareData: %w", err)
+	}
+	updated := false
+	filteredHostAnnotations := filterMetadata(host.Annotations)
+	filteredHardwareDataAnnotations := filterMetadata(hardwareData.Annotations)
+	if !maps.Equal(filteredHostAnnotations, filteredHardwareDataAnnotations) {
+		hardwareData.Annotations = filteredHostAnnotations
+		updated = true
+	}
+	filteredHostLabels := filterMetadata(host.Labels)
+	filteredHardwareDataLabels := filterMetadata(hardwareData.Labels)
+	if !maps.Equal(filteredHostLabels, filteredHardwareDataLabels) {
+		hardwareData.Labels = filteredHostLabels
+		updated = true
+	}
+	if updated {
+		if err := r.Client.Update(ctx, hardwareData); err != nil {
+			r.Log.Error(err, "failed to synchronize hardwareData metadata")
+		}
+	}
+	return nil
+}
+
+func filterMetadata(metadata map[string]string) map[string]string {
+	if metadata == nil {
+		return nil
+	}
+
+	// Filters out metal3.io and *.kubernetes.io domains from annotations and labels.
+	// to keep clean HardwareData annotations.
+	result := map[string]string{}
+	for key, value := range metadata {
+		keyItems := strings.Split(key, "/")
+		if len(keyItems) == 2 {
+			domain := keyItems[0]
+			if domain == "metal3.io" || domain == "kubernetes.io" || strings.HasSuffix(domain, ".kubernetes.io") {
+				continue
+			}
+		}
+		result[key] = value
+	}
+	return result
 }
