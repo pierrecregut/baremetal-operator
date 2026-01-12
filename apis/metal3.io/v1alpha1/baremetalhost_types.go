@@ -139,6 +139,26 @@ const (
 	DefaultBootMode BootMode = UEFI
 )
 
+const (
+	// ProvisionedCondition documents the provisioning state of the BareMetalHost toward the Provisioned goal.
+	ProvisionedCondition = "Provisioned"
+	// ProvisionedReason is the reason used when the BareMetalHost is provisioned.
+	ProvisionedReason = "Provisioned"
+	// ProvisionedReason is the reason used when the BareMetalHost is not provisioned and not provisioning.
+	NotProvisionedReason = "NotProvisioned"
+	// ProvisionedReason is the reason used when the BareMetalHost is provisioning.
+	ProvisioningReason = "Provisioning"
+
+	// AvailableCondition documents the provisioning state of the BareMetalHost toward the Available state.
+	AvailableCondition = "Available"
+	// AvailableReason is the reason used when the BareMetalHost is in available state.
+	AvailableReason = "Available"
+	// NotAvailableReason is the reason used when the BareMetalHost is not available and not inspecting.
+	NotAvailableReason = "NotAvailable"
+	// InspectingReason is the reason used when the BareMetalHost is reinspected.
+	InspectingReason = "Inspecting"
+)
+
 // OperationalStatus represents the state of the host.
 type OperationalStatus string
 
