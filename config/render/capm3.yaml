@@ -2856,9 +2856,11 @@ rules:
   resources:
   - secrets
   verbs:
+  - create
   - delete
   - get
   - list
+  - patch
   - update
   - watch
 - apiGroups:
@@ -3064,6 +3066,7 @@ spec:
       - args:
         - --enable-leader-election
         - --tls-min-version=TLS13
+        - --hostclaims
         command:
         - /baremetal-operator
         env:
