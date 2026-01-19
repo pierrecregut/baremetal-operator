@@ -19,7 +19,9 @@ package hostclaim
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"math/big"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -45,6 +47,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+type HostManagerInterface interface {
+	SetFinalizer()
+	UnsetFinalizer()
+	IsProvisioned() bool
+	SetPauseAnnotation(context.Context) error
+	RemovePauseAnnotation(context.Context) error
+	HasAnnotation(string) bool
+	SetConditionHostToFalse(string, string, string)
+	SetConditionHostToTrue(string, string)
+	Associate(context.Context) error
+	Delete(context.Context) error
+	Update(context.Context) error
+	PatchHost(context.Context, ...patch.Option) error
+}
 
 type HostManager struct {
 	client      client.Client
@@ -81,9 +98,11 @@ const (
 )
 
 var (
-	associateBMHMutex sync.Mutex
+	// Capm3FastTrack is the variable fetched from the CAPM3_FAST_TRACK environment variable.
+	Capm3FastTrack = os.Getenv("CAPM3_FAST_TRACK")
 	// An error raised when BareMetalHost does not exists (only because go vet does not like returning nil, nil).
-	ErrNotFound = errors.New("NotFound")
+	ErrNotFound       = errors.New("NotFound")
+	associateBMHMutex sync.Mutex
 )
 
 func NewHostManager(client client.Client, log logr.Logger, host *metal3api.HostClaim, apireader client.Reader) (*HostManager, error) {
@@ -98,6 +117,103 @@ func NewHostManager(client client.Client, log logr.Logger, host *metal3api.HostC
 		PatchHelper: patchHelper,
 		APIReader:   apireader,
 	}, nil
+}
+
+// SetFinalizer sets finalizer on the host.
+func (m *HostManager) SetFinalizer() {
+	if !controllerutil.ContainsFinalizer(m.HostClaim, metal3api.HostClaimFinalizer) {
+		controllerutil.AddFinalizer(m.HostClaim, metal3api.HostClaimFinalizer)
+	}
+}
+
+// UnsetFinalizer unsets finalizer on the host.
+func (m *HostManager) UnsetFinalizer() {
+	controllerutil.RemoveFinalizer(m.HostClaim, metal3api.HostClaimFinalizer)
+}
+
+// IsProvisioned checks if the baremetalhost associated to the hostclaim is provisioned.
+// This is visible is the Ready field of the status.
+func (m *HostManager) IsProvisioned() bool {
+	return conditions.IsTrue(m.HostClaim, metal3api.ProvisionedCondition)
+}
+
+// SetPauseAnnotation propagates the pause annotation from the hostclaim to the BareMetalHost.
+func (m *HostManager) SetPauseAnnotation(ctx context.Context) error {
+	// look for associated BMH
+	host, helper, err := m.getBmh(ctx)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if host == nil {
+		return nil
+	}
+	annotations := host.GetAnnotations()
+
+	if annotations != nil {
+		if _, ok := annotations[metal3api.PausedAnnotation]; ok {
+			m.Log.Info("BaremetalHost is already paused")
+			return nil
+		}
+	} else {
+		host.Annotations = make(map[string]string)
+	}
+	m.Log.Info("Adding PausedAnnotation in BareMetalHost")
+	host.Annotations[metal3api.PausedAnnotation] = PausedAnnotationKey
+
+	// Setting annotation with BMH status.
+	newAnnotation, err := json.Marshal(&host.Status)
+	if err != nil {
+		return errors.Wrap(err, "failed to marshall status annotation")
+	}
+	obj := map[string]interface{}{}
+	if err = json.Unmarshal(newAnnotation, &obj); err != nil {
+		return errors.Wrap(err, "failed to unmarshall status annotation")
+	}
+	delete(obj, "hardware")
+	newAnnotation, err = json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	host.Annotations[metal3api.StatusAnnotation] = string(newAnnotation)
+	return helper.Patch(ctx, host)
+}
+
+// RemovePauseAnnotation removes the pause annotation on the BareMetalHost.
+func (m *HostManager) RemovePauseAnnotation(ctx context.Context) error {
+	// look for associated BMH
+	bmh, helper, err := m.getBmh(ctx)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return errors.Wrap(err, "Cannot access BareMetalHost")
+	}
+
+	if bmh == nil {
+		return nil
+	}
+
+	annotations := bmh.GetAnnotations()
+
+	if annotations != nil {
+		if _, ok := annotations[metal3api.PausedAnnotation]; ok {
+			if annotations[metal3api.PausedAnnotation] == PausedAnnotationKey {
+				// Removing BMH Paused Annotation Since Owner Cluster is not paused.
+				delete(bmh.Annotations, metal3api.PausedAnnotation)
+			} else {
+				m.Log.Info("BMH is paused by user. Not removing Pause Annotation")
+				return nil
+			}
+		}
+	}
+	return helper.Patch(ctx, bmh)
+}
+
+// HasAnnotation makes sure the host has an annotation that references a host.
+func (m *HostManager) HasAnnotation(annotation string) bool {
+	annotations := m.HostClaim.ObjectMeta.GetAnnotations()
+	if annotations == nil {
+		return false
+	}
+	_, ok := annotations[annotation]
+	return ok
 }
 
 // SetConditionHostToFalse sets Host condition status to False.
@@ -226,6 +342,124 @@ func (m *HostManager) Update(ctx context.Context) error {
 	m.updateHostClaimStatus(bmh)
 
 	m.Log.Info("Finished updating machine")
+	return nil
+}
+
+// Delete deletes a Hostclaim and is invoked by the Machine Controller.
+func (m *HostManager) Delete(ctx context.Context) error {
+	m.Log.Info("Deleting host machine", "host", m.HostClaim.Name)
+
+	// clear an error if one was previously set.
+
+	if Capm3FastTrack == "" {
+		Capm3FastTrack = "false"
+		m.Log.Info("Capm3FastTrack is not set, setting it to default value false")
+	}
+
+	bmh, helper, err := m.getBmh(ctx)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if bmh == nil {
+		m.Log.Info("baremetalhost not found for host", "host", m.HostClaim.Name)
+		return nil
+	}
+
+	if bmh.Spec.ConsumerRef != nil {
+		// ConsumerRef must match because of getBmh
+		bmhUpdated := false
+
+		if bmh.Spec.Image != nil {
+			bmh.Spec.Image = nil
+			bmhUpdated = true
+		}
+		if m.HostClaim.Spec.UserData != nil && bmh.Spec.UserData != nil {
+			if err := m.clearSecret(ctx, bmh.Spec.UserData.Name, bmh.Namespace); err != nil {
+				return err
+			}
+			bmh.Spec.UserData = nil
+			bmhUpdated = true
+		}
+		if m.HostClaim.Spec.MetaData != nil && bmh.Spec.MetaData != nil {
+			if err := m.clearSecret(ctx, bmh.Spec.MetaData.Name, bmh.Namespace); err != nil {
+				return err
+			}
+			bmh.Spec.MetaData = nil
+			bmhUpdated = true
+		}
+		if m.HostClaim.Spec.NetworkData != nil && bmh.Spec.NetworkData != nil {
+			if err := m.clearSecret(ctx, bmh.Spec.NetworkData.Name, bmh.Namespace); err != nil {
+				return err
+			}
+			bmh.Spec.NetworkData = nil
+			bmhUpdated = true
+		}
+
+		onlineStatus := bmh.Spec.Online
+
+		// We force Cleaning when the hostClaim is deleted.
+		if bmh.Spec.AutomatedCleaningMode != metal3api.CleaningModeMetadata {
+			bmhUpdated = true
+			bmh.Spec.AutomatedCleaningMode = metal3api.CleaningModeMetadata
+		}
+
+		switch Capm3FastTrack {
+		case "true":
+			bmh.Spec.Online = true
+		case "false":
+			bmh.Spec.Online = false
+		}
+
+		if onlineStatus != bmh.Spec.Online {
+			bmhUpdated = true
+		}
+
+		if bmhUpdated {
+			// Update the BMH object, if the errors are NotFound, do not return the
+			// errors.
+			if err := patchIfFound(ctx, helper, bmh); err != nil {
+				return err
+			}
+
+			m.Log.Info("Deprovisioning BaremetalHost, requeuing")
+			return &RequeueAfterError{RequeueAfter: ConflictRequeueDelay}
+		}
+
+		waiting := true
+		switch bmh.Status.Provisioning.State {
+		case metal3api.StateRegistering,
+			metal3api.StateMatchProfile, metal3api.StateInspecting,
+			metal3api.StateReady, metal3api.StateAvailable, metal3api.StateNone,
+			metal3api.StateUnmanaged:
+			// Host is not provisioned.
+			waiting = false
+		case metal3api.StateExternallyProvisioned:
+			// We have no control over provisioning, so just wait until the
+			// host is powered off.
+			waiting = bmh.Status.PoweredOn
+		default:
+		}
+		if waiting {
+			m.Log.Info("Deprovisioning BaremetalHost, requeuing until available")
+			return &RequeueAfterError{RequeueAfter: HostClaimRequeueDelay}
+		}
+
+		m.Log.Info("Removing Paused Annotation (if any)")
+		if bmh.Annotations != nil && bmh.Annotations[metal3api.PausedAnnotation] == PausedAnnotationKey {
+			delete(bmh.Annotations, metal3api.PausedAnnotation)
+		}
+
+		// ConsumerRef removed last. Made atomic with next step.
+		bmh.Spec.ConsumerRef = nil
+
+		// Update the BMH object, if the errors are NotFound, do not return the
+		// errors.
+		if err := patchIfFound(ctx, helper, bmh); err != nil {
+			return err
+		}
+	}
+
+	m.Log.Info("finished deleting HostClaim")
 	return nil
 }
 
@@ -813,6 +1047,45 @@ func nodeReuseLabelExists(bmh *metal3api.BareMetalHost) bool {
 	}
 	_, ok := bmh.Labels[nodeReuseLabelName]
 	return ok
+}
+
+func (m *HostManager) clearSecret(ctx context.Context, name, namespace string) error {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{
+		Name:      name,
+		Namespace: namespace,
+	}
+	if err := m.client.Get(ctx, key, secret); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return m.client.Delete(ctx, secret)
+}
+
+func patchIfFound(ctx context.Context, helper *patch.Helper, host client.Object) error {
+	err := helper.Patch(ctx, host)
+	if err != nil {
+		notFound := true
+		var aggr kerrors.Aggregate
+		if ok := errors.As(err, &aggr); ok {
+			for _, kerr := range aggr.Errors() {
+				if !k8serrors.IsNotFound(kerr) {
+					notFound = false
+				}
+				if k8serrors.IsConflict(kerr) {
+					return &RequeueAfterError{RequeueAfter: ConflictRequeueDelay}
+				}
+			}
+		} else {
+			notFound = false
+		}
+		if notFound {
+			return nil
+		}
+	}
+	return err
 }
 
 type Set[T comparable] = map[T]struct{}

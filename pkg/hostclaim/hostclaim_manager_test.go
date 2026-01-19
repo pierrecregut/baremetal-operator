@@ -20,6 +20,7 @@ package hostclaim
 
 import (
 	"context"
+	"encoding/json"
 	"maps"
 	"reflect"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -55,6 +57,36 @@ func setupScheme() *runtime.Scheme {
 }
 
 var _ = Describe("HostClaim manager", func() {
+	DescribeTable("Test Finalizers",
+		func(hc *metal3api.HostClaim) {
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).Build()
+			hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, hc, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			hostMgr.SetFinalizer()
+			Expect(hc.ObjectMeta.Finalizers).To(ContainElement(
+				metal3api.HostClaimFinalizer,
+			))
+
+			hostMgr.UnsetFinalizer()
+
+			Expect(hc.ObjectMeta.Finalizers).NotTo(ContainElement(
+				metal3api.HostClaimFinalizer,
+			))
+		},
+		Entry("No finalizers", NewHostclaim(HostclaimName)),
+		Entry("Additional Finalizers",
+			NewHostclaim(HostclaimName, WithFinalizers{"finz"}),
+		),
+	)
+
+	type testCaseSetPauseAnnotation struct {
+		HostClaim           *metal3api.HostClaim
+		BareMetalHost       *metal3api.BareMetalHost
+		ExpectPausePresent  bool
+		ExpectStatusPresent bool
+		ExpectError         bool
+	}
+
 	var defaultConsumerRef = WithConsumerRef{
 		Name:       HostclaimName,
 		Namespace:  HostclaimNamespace,
@@ -65,6 +97,207 @@ var _ = Describe("HostClaim manager", func() {
 	var (
 		defaultImage = metal3api.Image{URL: "url"}
 	)
+
+	var otherConsumerRef = WithConsumerRef{
+		Name:       HostclaimName,
+		Namespace:  "otherNs",
+		Kind:       HostClaimKind,
+		APIVersion: metal3api.GroupVersion.String(),
+	}
+
+	DescribeTable("Test Set BMH Pause Annotation",
+		func(tc testCaseSetPauseAnnotation) {
+			objs := []client.Object{tc.HostClaim}
+			if tc.BareMetalHost != nil {
+				objs = append(objs, tc.BareMetalHost)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+
+			hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = hostMgr.SetPauseAnnotation(context.TODO())
+			if tc.ExpectError {
+				Expect(err).To(HaveOccurred())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+			if tc.BareMetalHost == nil {
+				return
+			}
+			savedHost := metal3api.BareMetalHost{}
+			err = fakeClient.Get(context.TODO(),
+				client.ObjectKey{
+					Name:      tc.BareMetalHost.Name,
+					Namespace: tc.BareMetalHost.Namespace,
+				},
+				&savedHost,
+			)
+			Expect(err).NotTo(HaveOccurred())
+			_, pausePresent := savedHost.Annotations[metal3api.PausedAnnotation]
+			if tc.ExpectPausePresent {
+				Expect(pausePresent).To(BeTrue())
+			} else {
+				Expect(pausePresent).To(BeFalse())
+			}
+			status, statusPresent := savedHost.Annotations[metal3api.StatusAnnotation]
+			if tc.ExpectStatusPresent {
+				Expect(statusPresent).To(BeTrue())
+				annotation, err := json.Marshal(&tc.BareMetalHost.Status)
+				Expect(err).ToNot(HaveOccurred())
+				// (Note) manager code marshals the inspection data stored in annotation,
+				// which causes alphabetically reordering of keys. Since we are marshaling
+				// only the annotation, the status value here doesn't match the marshaled
+				// annotation data, because it wasn't re-ordered by the JSON marshaller.
+				// That's why we are marshaling status data as well so that its fields are
+				// also alphabetically reordered to match the annotation keys style..
+				obj := map[string]interface{}{}
+				err = json.Unmarshal(annotation, &obj)
+				Expect(err).ToNot(HaveOccurred())
+				annotation, _ = json.Marshal(obj)
+				Expect(status).To(Equal(string(annotation)))
+			} else {
+				Expect(statusPresent).To(BeFalse())
+			}
+		},
+		Entry("Set BMH Pause Annotation, with valid CAPM3 Paused annotations, already paused", testCaseSetPauseAnnotation{
+			BareMetalHost: NewBaremetalhost(
+				"bmh1", "ns1", metal3api.StateProvisioned, defaultConsumerRef,
+				WithAnnotations{metal3api.PausedAnnotation: PausedAnnotationKey},
+			),
+			HostClaim:          NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns1/bmh1"}),
+			ExpectPausePresent: true,
+			ExpectError:        false,
+		}),
+		Entry("Set BMH Pause Annotation, with valid Paused annotations, Empty Key, already paused", testCaseSetPauseAnnotation{
+			BareMetalHost: NewBaremetalhost(
+				"bmh1", "ns1", metal3api.StateProvisioned, defaultConsumerRef,
+				WithAnnotations{metal3api.PausedAnnotation: ""},
+			),
+			HostClaim:          NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns1/bmh1"}),
+			ExpectPausePresent: true,
+			ExpectError:        false,
+		}),
+		Entry("Set BMH Pause Annotation, with no Paused annotations", testCaseSetPauseAnnotation{
+			BareMetalHost: NewBaremetalhost(
+				"bmh1", "ns1", metal3api.StateProvisioned, defaultConsumerRef,
+			),
+			HostClaim:           NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns1/bmh1"}),
+			ExpectPausePresent:  true,
+			ExpectStatusPresent: true,
+			ExpectError:         false,
+		}),
+		Entry("Set BMH Pause Annotation, no bmh", testCaseSetPauseAnnotation{
+			BareMetalHost: nil,
+			HostClaim:     NewHostclaim(HostclaimName),
+		}),
+	)
+
+	type testCaseRemovePauseAnnotation struct {
+		HostClaim     *metal3api.HostClaim
+		BareMetalHost *metal3api.BareMetalHost
+		ExpectPresent bool
+		ExpectError   bool
+	}
+
+	DescribeTable("Test Remove BMH Pause Annotation",
+		func(tc testCaseRemovePauseAnnotation) {
+			objs := []client.Object{tc.HostClaim}
+			if tc.BareMetalHost != nil {
+				objs = append(objs, tc.BareMetalHost)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+
+			hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = hostMgr.RemovePauseAnnotation(context.TODO())
+			if tc.ExpectError {
+				Expect(err).To(HaveOccurred())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+			if tc.BareMetalHost == nil {
+				return
+			}
+			savedHost := metal3api.BareMetalHost{}
+			err = fakeClient.Get(context.TODO(),
+				client.ObjectKey{
+					Name:      tc.BareMetalHost.Name,
+					Namespace: tc.BareMetalHost.Namespace,
+				},
+				&savedHost,
+			)
+			Expect(err).NotTo(HaveOccurred())
+			if tc.ExpectPresent {
+				Expect(savedHost.Annotations[metal3api.PausedAnnotation]).NotTo(BeNil())
+			} else {
+				Expect(savedHost.Annotations).To(BeNil())
+			}
+		},
+		Entry("Remove BMH Pause Annotation, with valid CAPM3 Paused annotations", testCaseRemovePauseAnnotation{
+			BareMetalHost: NewBaremetalhost(
+				"bmh1", "ns1", metal3api.StateProvisioned, defaultConsumerRef,
+				WithAnnotations{metal3api.PausedAnnotation: PausedAnnotationKey},
+			),
+			HostClaim:     NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns1/bmh1"}),
+			ExpectPresent: false,
+			ExpectError:   false,
+		}),
+		Entry("Do not Remove Annotation, with valid Paused annotations, Empty Key", testCaseRemovePauseAnnotation{
+			BareMetalHost: NewBaremetalhost(
+				"bmh1", "ns1", metal3api.StateProvisioned, defaultConsumerRef,
+				WithAnnotations{metal3api.PausedAnnotation: ""},
+			),
+			HostClaim:     NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns1/bmh1"}),
+			ExpectPresent: true,
+			ExpectError:   false,
+		}),
+		Entry("No Annotation, Should Not Error", testCaseRemovePauseAnnotation{
+			BareMetalHost: NewBaremetalhost(
+				"bmh1", "ns1", metal3api.StateProvisioned, defaultConsumerRef,
+			),
+			HostClaim:     NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns1/bmh1"}),
+			ExpectPresent: false,
+			ExpectError:   false,
+		}),
+		Entry("No Bmh, Should Not Error", testCaseRemovePauseAnnotation{
+			BareMetalHost: nil,
+			HostClaim:     NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns1/bmh1"}),
+		}),
+	)
+
+	type testHasAnnotation struct {
+		HostClaim *metal3api.HostClaim
+		Result    bool
+	}
+
+	DescribeTable("Test HasAnnotation",
+		func(tc testHasAnnotation) {
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).Build()
+			hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			result := hostMgr.HasAnnotation(BareMetalHostAnnotation)
+			Expect(result).To(Equal(tc.Result))
+		},
+		Entry("no annotation", testHasAnnotation{HostClaim: NewHostclaim(HostclaimName), Result: false}),
+		Entry("other annotation", testHasAnnotation{HostClaim: NewHostclaim(HostclaimName, WithAnnotations{"other": "v"}), Result: false}),
+		Entry("other annotation", testHasAnnotation{HostClaim: NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns/bmh"}), Result: true}),
+	)
+
+	var provisionedCondition = Condition{Type: metal3api.ProvisionedCondition, Status: true, Reason: "any"}
+
+	It("test IsProvisionned", func() {
+		hc1 := NewHostclaim(HostclaimName)
+		hc2 := NewHostclaim(HostclaimName, provisionedCondition)
+		fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).Build()
+		hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, hc1, fakeClient)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hostMgr.IsProvisioned()).To(BeFalse())
+		hostMgr, err = NewHostManager(fakeClient, GinkgoLogr, hc2, fakeClient)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hostMgr.IsProvisioned()).To(BeTrue())
+	})
 
 	type testCaseChooseBMH struct {
 		HostClaim          *metal3api.HostClaim
@@ -497,6 +730,63 @@ var _ = Describe("HostClaim manager", func() {
 		}),
 	)
 
+	type testCaseGetBMH struct {
+		HostClaim     *metal3api.HostClaim
+		BareMetalHost *metal3api.BareMetalHost
+		ExpectFails   bool
+	}
+
+	var (
+		hcDefault  = NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns/bmh"})
+		hcNoAnnot  = NewHostclaim(HostclaimName, WithAnnotations{})
+		hcBadAnnot = NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns/bmh/other"})
+	)
+	DescribeTable("Test getBMH",
+		func(tc testCaseGetBMH) {
+			hc := tc.HostClaim.DeepCopy()
+			objs := []client.Object{hc}
+			if tc.BareMetalHost != nil {
+				objs = append(objs, tc.BareMetalHost)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+			hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, hc, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			bmh, _, err := hostMgr.getBmh(context.TODO())
+			if tc.ExpectFails {
+				Expect(err).To(HaveOccurred())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(bmh.Name).To(Equal("bmh"))
+			}
+
+		},
+		Entry("no bmh", testCaseGetBMH{HostClaim: hcDefault, BareMetalHost: nil, ExpectFails: true}),
+		Entry("bmh no consumer ref",
+			testCaseGetBMH{
+				HostClaim:     hcDefault,
+				BareMetalHost: NewBaremetalhost("bmh", "ns", metal3api.StateAvailable),
+				ExpectFails:   true}),
+		Entry("bmh bad consumer ref",
+			testCaseGetBMH{
+				HostClaim:     hcDefault,
+				BareMetalHost: NewBaremetalhost("bmh", "ns", metal3api.StateAvailable, otherConsumerRef),
+				ExpectFails:   true}),
+		Entry("bmh with righ consumer ref",
+			testCaseGetBMH{
+				HostClaim:     hcDefault,
+				BareMetalHost: NewBaremetalhost("bmh", "ns", metal3api.StateAvailable, defaultConsumerRef)}),
+		Entry("hostclaim no annotation",
+			testCaseGetBMH{
+				HostClaim:     hcNoAnnot,
+				BareMetalHost: NewBaremetalhost("bmh", "ns", metal3api.StateAvailable, defaultConsumerRef),
+				ExpectFails:   true}),
+		Entry("hostclaim bad annotation",
+			testCaseGetBMH{
+				HostClaim:     hcBadAnnot,
+				BareMetalHost: NewBaremetalhost("bmh", "ns", metal3api.StateAvailable, defaultConsumerRef),
+				ExpectFails:   true}),
+	)
+
 	DescribeTable("Test updateHostClaimStatus",
 		func(state metal3api.ProvisioningState, provisionned, available bool) {
 			hostClaim := NewHostclaim(
@@ -563,6 +853,35 @@ var _ = Describe("HostClaim manager", func() {
 		},
 	)
 
+	It("test Patch if found",
+		func() {
+			ctx := context.TODO()
+			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable)
+			oldBmh := bmh.DeepCopy()
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(bmh).Build()
+			bmh.Spec.Description = "v0"
+			err := fakeClient.Update(ctx, bmh)
+			Expect(err).NotTo(HaveOccurred())
+			helper, err := patch.NewHelper(bmh, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			bmh.Spec.Description = "v1"
+			err = patchIfFound(ctx, helper, bmh)
+			Expect(err).NotTo(HaveOccurred(), "Patch succeeds")
+			helper, err = patch.NewHelper(oldBmh, fakeClient)
+			oldBmh.ResourceVersion = "234"
+			oldBmh.Spec.Description = "v2"
+			err = patchIfFound(ctx, helper, oldBmh)
+			Expect(err).To(HaveOccurred(), "Conflict error becomes requeue")
+			var requeueAfterError HasRequeueAfterError
+			Expect(errors.As(err, &requeueAfterError)).To(BeTrue())
+			err = fakeClient.Delete(ctx, bmh)
+			Expect(err).NotTo(HaveOccurred())
+			helper, err = patch.NewHelper(bmh, fakeClient)
+			bmh.Spec.Description = "v2"
+			err = patchIfFound(ctx, helper, bmh)
+			Expect(err).NotTo(HaveOccurred(), "Not found is ignored")
+		})
+
 	type testCaseUpdate struct {
 		HostClaim  *metal3api.HostClaim
 		ExpectFail bool
@@ -592,6 +911,87 @@ var _ = Describe("HostClaim manager", func() {
 		Entry("no bmh", testCaseUpdate{HostClaim: NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns/other"}), ExpectFail: true}),
 	)
 
+	type testCaseDelete struct {
+		BareMetalHost *metal3api.BareMetalHost
+		ExpectRequeue bool
+		SecretCleared bool
+	}
+	DescribeTable("Test Delete",
+		func(tc testCaseDelete) {
+			ctx := context.TODO()
+			hcOpts := []HostclaimOption{
+				WithUserData("sec1"), WithMetaData("sec2"), WithNetworkData("sec3"),
+				WithAnnotations{BareMetalHostAnnotation: "ns/bmh"},
+			}
+			hc := NewHostclaim(HostclaimName, hcOpts...)
+			objects := []client.Object{
+				hc,
+				NewHostdeploypolicy("hdp", "ns", AcceptNames{HostclaimNamespace}),
+				NewNamespace("hcNs"), NewNamespace("ns"),
+			}
+			if tc.BareMetalHost != nil {
+				bmh := tc.BareMetalHost
+				objects = append(objects, bmh)
+				for _, ref := range []*corev1.SecretReference{bmh.Spec.UserData, bmh.Spec.MetaData, bmh.Spec.NetworkData} {
+					if ref != nil && !tc.SecretCleared {
+						sec := NewSecret(ref.Name, "ns", WithData{"data": []byte("v")})
+						objects = append(objects, sec)
+					}
+				}
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objects...).Build()
+			hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, hc, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			err = hostMgr.Delete(ctx)
+			bmhOut := &metal3api.BareMetalHost{}
+			if tc.BareMetalHost == nil {
+				return
+			}
+			e2 := fakeClient.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "bmh"}, bmhOut)
+			Expect(e2).NotTo(HaveOccurred())
+			if tc.ExpectRequeue {
+				Expect(err).To(HaveOccurred())
+				var requeueAfterError HasRequeueAfterError
+				Expect(errors.As(err, &requeueAfterError)).To(BeTrue())
+				Expect(bmhOut.Spec.Image).To(BeNil())
+				Expect(bmhOut.Spec.UserData).To(BeNil())
+				Expect(bmhOut.Spec.MetaData).To(BeNil())
+				Expect(bmhOut.Spec.NetworkData).To(BeNil())
+				Expect(bmhOut.Spec.ConsumerRef).NotTo(BeNil(), "Access to bmh is kept")
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(bmhOut.Spec.ConsumerRef).To(BeNil(), "Access to bmh is revoked")
+				Expect(bmhOut.Spec.Online).To(BeFalse(), "host is offline")
+			}
+		},
+		Entry("First step remove secrets", testCaseDelete{
+			BareMetalHost: NewBaremetalhost(
+				"bmh", "ns", metal3api.StateAvailable, defaultConsumerRef,
+				WithUserData("bmh-user-data"), WithMetaData("bmh-meta-data"), WithNetworkData("bmh-network-data"),
+				PoweredOnTrue{},
+				WithImage{Image: defaultImage}),
+			ExpectRequeue: true,
+		}),
+		Entry("First step remove secrets", testCaseDelete{
+			BareMetalHost: NewBaremetalhost(
+				"bmh", "ns", metal3api.StateAvailable, defaultConsumerRef,
+				WithUserData("bmh-user-data"),
+				PoweredOnTrue{},
+				WithImage{Image: defaultImage}),
+			ExpectRequeue: true,
+			SecretCleared: true,
+		}),
+		Entry("Second step, wait for deprovisioning", testCaseDelete{
+			BareMetalHost: NewBaremetalhost("bmh", "ns", metal3api.StateProvisioned, defaultConsumerRef),
+			ExpectRequeue: true,
+		}),
+		Entry("Last step, cleanup", testCaseDelete{
+			BareMetalHost: NewBaremetalhost("bmh", "ns", metal3api.StateAvailable, defaultConsumerRef, WithCleaningMode("metadata")),
+		}),
+		Entry("No BMH", testCaseDelete{
+			BareMetalHost: nil,
+		}),
+	)
 })
 
 func TestManagers(t *testing.T) {
