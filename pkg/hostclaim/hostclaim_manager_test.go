@@ -55,6 +55,12 @@ func setupScheme() *runtime.Scheme {
 }
 
 var _ = Describe("HostClaim manager", func() {
+	var defaultConsumerRef = WithConsumerRef{
+		Name:       HostclaimName,
+		Namespace:  HostclaimNamespace,
+		Kind:       HostClaimKind,
+		APIVersion: metal3api.GroupVersion.String(),
+	}
 
 	var (
 		defaultImage = metal3api.Image{URL: "url"}
@@ -555,6 +561,35 @@ var _ = Describe("HostClaim manager", func() {
 			saved[rebootDomain] = "v1"
 			Expect(maps.Equal(bmh.Annotations, saved)).To(BeTrue())
 		},
+	)
+
+	type testCaseUpdate struct {
+		HostClaim  *metal3api.HostClaim
+		ExpectFail bool
+	}
+	DescribeTable("test Update",
+		func(tc testCaseUpdate) {
+			ctx := context.TODO()
+			hc := tc.HostClaim
+			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable, defaultConsumerRef)
+			objects := []client.Object{
+				hc, bmh,
+				NewHostdeploypolicy("hdp", "ns", AcceptNames{HostclaimNamespace}),
+				NewNamespace("hcNs"), NewNamespace("ns"),
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objects...).Build()
+			hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, hc, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			err = hostMgr.Update(ctx)
+			if tc.ExpectFail {
+				Expect(err).To(HaveOccurred())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+		},
+		Entry("Regular case", testCaseUpdate{HostClaim: NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns/bmh"})}),
+		Entry("Bad annotation fail BMH", testCaseUpdate{HostClaim: NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "a/b/c"}), ExpectFail: true}),
+		Entry("no bmh", testCaseUpdate{HostClaim: NewHostclaim(HostclaimName, WithAnnotations{BareMetalHostAnnotation: "ns/other"}), ExpectFail: true}),
 	)
 
 })

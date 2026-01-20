@@ -36,6 +36,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/cache"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -177,6 +178,57 @@ func (m *HostManager) Associate(ctx context.Context) error {
 	return nil
 }
 
+// Update updates a machine and is invoked by the Machine Controller.
+func (m *HostManager) Update(ctx context.Context) error {
+	m.Log.Info("Updating machine")
+
+	// clear any error message that was previously set. This method doesn't set
+	// error messages yet, so we know that it's incorrect to have one here.
+
+	bmh, helper, err := m.getBmh(ctx)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		m.SetConditionHostToFalse(
+			metal3api.AssociatedCondition, metal3api.MissingBareMetalHostReason,
+			"Failed to get a BareMetalHost for the Host")
+		return err
+	}
+	if bmh == nil {
+		m.SetConditionHostToFalse(
+			metal3api.AssociatedCondition, metal3api.MissingBareMetalHostReason,
+			"BareMetalHost associated to the claim not found")
+		return errors.Errorf("BareMetalHost not found")
+	}
+
+	// ensure that the BMH specs are correctly set.
+	err = m.setBmhSpec(ctx, bmh)
+	if err != nil {
+		return err
+	}
+
+	if bmh.Annotations == nil {
+		bmh.Annotations = map[string]string{}
+	}
+
+	syncReboot(m.HostClaim.Annotations, bmh.Annotations)
+
+	err = helper.Patch(ctx, bmh)
+	if err != nil {
+		m.SetConditionHostToFalse(
+			metal3api.SynchronizedCondition, metal3api.BareMetalHostNotSynchronizedReason,
+			"Failed to update BareMetalHost")
+		m.Log.Error(err, "Error while patching the BareMetalHost")
+		return hideConflictError(err)
+	}
+
+	// transient rebootAnnotation was successfully transmitted. We can delete it on HostClaim
+	delete(m.HostClaim.Annotations, rebootDomain)
+
+	m.updateHostClaimStatus(bmh)
+
+	m.Log.Info("Finished updating machine")
+	return nil
+}
+
 // PatchHost patch the HostClaim and ensures that the conditions are initialized.
 // Can be used several times without creating a conflict.
 func (m *HostManager) PatchHost(ctx context.Context, options ...patch.Option) error {
@@ -209,6 +261,56 @@ func (m *HostManager) PatchHost(ctx context.Context, options ...patch.Option) er
 		m.PatchHelper = nil
 	}
 	return err
+}
+
+// getBmh gets the associated BareMetalHost by looking for an annotation on the machine
+// that contains a reference to the host. Returns nil if not found. Assumes the
+// host is in the same namespace as the machine.
+func (m *HostManager) getBmh(ctx context.Context) (*metal3api.BareMetalHost, *patch.Helper, error) {
+	host, err := getBmh(ctx, m.HostClaim, m.client, m.Log)
+	if err != nil || host == nil {
+		return host, nil, err
+	}
+	helper, err := patch.NewHelper(host, m.client)
+	return host, helper, err
+}
+
+func getBmh(ctx context.Context, hostClaim *metal3api.HostClaim, cl client.Client,
+	mLog logr.Logger,
+) (*metal3api.BareMetalHost, error) {
+	annotations := hostClaim.ObjectMeta.GetAnnotations()
+	if annotations == nil {
+		return nil, ErrNotFound
+	}
+	bmhKey, ok := annotations[BareMetalHostAnnotation]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	bmhNamespace, bmhName, err := cache.SplitMetaNamespaceKey(bmhKey)
+	if err != nil {
+		mLog.Error(err, "Error parsing annotation value", "annotation key", bmhKey)
+		return nil, err
+	}
+
+	bmh := metal3api.BareMetalHost{}
+	key := types.NamespacedName{
+		Name:      bmhName,
+		Namespace: bmhNamespace,
+	}
+	err = cl.Get(ctx, key, &bmh)
+	if k8serrors.IsNotFound(err) {
+		mLog.Info("Annotated host not found", "host", bmhKey)
+		return nil, ErrNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	// This is an important security check. We do not trust the annotation. Only the ConsumerRef
+	if !consumerRefMatches(bmh.Spec.ConsumerRef, hostClaim) {
+		mLog.Info("The consumer ref does not point to the hostClaim", "consumerRef", bmh.Spec.ConsumerRef)
+		delete(annotations, BareMetalHostAnnotation)
+		return nil, ErrNotFound
+	}
+	return &bmh, nil
 }
 
 func (m *HostManager) setBmhConsumerRef(bmh *metal3api.BareMetalHost) {
