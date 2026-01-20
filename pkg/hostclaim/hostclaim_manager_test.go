@@ -20,6 +20,8 @@ package hostclaim
 
 import (
 	"context"
+	"reflect"
+	"strings"
 	"testing"
 
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
@@ -346,6 +348,144 @@ var _ = Describe("HostClaim manager", func() {
 					Key: "k", Operator: selection.Exists, Values: []string{}}}),
 			ExpectFails:   true,
 			ExpectRequeue: true,
+		}),
+	)
+
+	type testCaseSetBMHSpec struct {
+		UserData        *corev1.Secret
+		NetworkData     *corev1.Secret
+		MetaData        *corev1.Secret
+		BMHUserData     *corev1.Secret
+		BMHNetworkData  *corev1.Secret
+		BMHMetaData     *corev1.Secret
+		SetImage        bool
+		SetCustomDeploy bool
+		SetPoweredOn    bool
+	}
+
+	DescribeTable("Test setBMHspec",
+		func(tc testCaseSetBMHSpec) {
+			hcOptions := []HostclaimOption{}
+			ctx := context.TODO()
+			objects := []client.Object{}
+			numSecrets := 0
+			if tc.UserData != nil {
+				hcOptions = append(hcOptions, WithUserData(tc.UserData.Name))
+				if !strings.HasPrefix(tc.UserData.Name, "removed") {
+					objects = append(objects, tc.UserData)
+					numSecrets++
+				}
+			}
+			if tc.MetaData != nil {
+				hcOptions = append(hcOptions, WithMetaData(tc.MetaData.Name))
+				if !strings.HasPrefix(tc.MetaData.Name, "removed") {
+					objects = append(objects, tc.MetaData)
+					numSecrets++
+				}
+			}
+			if tc.NetworkData != nil {
+				hcOptions = append(hcOptions, WithNetworkData(tc.NetworkData.Name))
+				if !strings.HasPrefix(tc.MetaData.Name, "removed") {
+					objects = append(objects, tc.NetworkData)
+					numSecrets++
+				}
+			}
+			if tc.SetImage {
+				hcOptions = append(hcOptions, WithImage{Image: defaultImage})
+			}
+			if tc.SetCustomDeploy {
+				hcOptions = append(hcOptions, WithCustomDeploy("custom"))
+			}
+			hostClaim := NewHostclaim(HostclaimName, hcOptions...)
+			bmhOptions := []BaremetalhostOption{}
+			if tc.BMHUserData != nil {
+				bmhOptions = append(bmhOptions, WithUserData(tc.BMHUserData.Name))
+				objects = append(objects, tc.BMHUserData)
+			}
+			if tc.BMHMetaData != nil {
+				bmhOptions = append(bmhOptions, WithMetaData(tc.BMHMetaData.Name))
+				objects = append(objects, tc.BMHMetaData)
+			}
+			if tc.BMHNetworkData != nil {
+				bmhOptions = append(bmhOptions, WithNetworkData(tc.BMHNetworkData.Name))
+				objects = append(objects, tc.BMHNetworkData)
+			}
+			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable, bmhOptions...)
+			objects = append(objects, hostClaim, bmh)
+			// Add secrets if they exists
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objects...).Build()
+			hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, hostClaim, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			err = hostMgr.setBmhSpec(ctx, bmh)
+			errorExpected := false
+			var checkSecret = func(ref *corev1.SecretReference, source *corev1.Secret, message string) {
+				if source == nil {
+					Expect(ref).To(BeNil(), message)
+				} else if strings.HasPrefix(source.Name, "removed") {
+					Expect(ref).To(BeNil(), message)
+					errorExpected = true
+				} else {
+					Expect(ref).NotTo(BeNil(), message)
+					sec := &corev1.Secret{}
+					key := client.ObjectKey{Name: ref.Name, Namespace: "ns"}
+					err = fakeClient.Get(ctx, key, sec)
+					Expect(err).NotTo(HaveOccurred(), message)
+					Expect(reflect.DeepEqual(sec.Data, source.Data)).To(BeTrue(), message)
+				}
+			}
+			checkSecret(bmh.Spec.UserData, tc.UserData, "userdata coherence")
+			checkSecret(bmh.Spec.MetaData, tc.MetaData, "metadata coherence")
+			checkSecret(bmh.Spec.NetworkData, tc.NetworkData, "networkdata coherence")
+			if errorExpected {
+				Expect(err).To(HaveOccurred())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+			secrets := &corev1.SecretList{}
+			err = fakeClient.List(ctx, secrets, client.InNamespace("ns"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secrets.Items).To(HaveLen(numSecrets))
+			if tc.SetImage {
+				Expect(bmh.Spec.Image).NotTo(BeNil())
+				Expect(*bmh.Spec.Image).To(Equal(defaultImage))
+			}
+			if tc.SetCustomDeploy {
+				Expect(bmh.Spec.CustomDeploy).NotTo(BeNil())
+				Expect(bmh.Spec.CustomDeploy.Method).To(Equal("custom"))
+			}
+		},
+		Entry("set user-data (initialize)", testCaseSetBMHSpec{
+			UserData: NewSecret("s1", HostclaimNamespace, WithData{"f": []byte("udt")}),
+		}),
+		Entry("set user-data (override)", testCaseSetBMHSpec{
+			UserData:    NewSecret("s1", HostclaimNamespace, WithData{"f": []byte("udt")}),
+			BMHUserData: NewSecret("bmh-userdata", "ns", WithData{"f": []byte("other")}),
+		}),
+		Entry("reset user-data (override)", testCaseSetBMHSpec{
+			BMHUserData: NewSecret("bmh-userdata", "ns", WithData{"f": []byte("other")}),
+		}),
+		Entry("set meta-data/network-data (initialize)", testCaseSetBMHSpec{
+			MetaData:    NewSecret("s1", HostclaimNamespace, WithData{"f": []byte("mdt")}),
+			NetworkData: NewSecret("s2", HostclaimNamespace, WithData{"f": []byte("nwdt")}),
+		}),
+		Entry("set meta-data/network-data (overide)", testCaseSetBMHSpec{
+			MetaData:       NewSecret("s1", HostclaimNamespace, WithData{"f": []byte("mdt")}),
+			NetworkData:    NewSecret("s2", HostclaimNamespace, WithData{"f": []byte("nwdt")}),
+			BMHMetaData:    NewSecret("bmh-metadata", "ns", WithData{"f": []byte("other")}),
+			BMHNetworkData: NewSecret("bmh-networkdata", "ns", WithData{"f": []byte("other")}),
+		}),
+		Entry("reset meta-data/network-data (overide)", testCaseSetBMHSpec{
+			BMHMetaData:    NewSecret("bmh-metadata", "ns", WithData{"f": []byte("other")}),
+			BMHNetworkData: NewSecret("bmh-networkdata", "ns", WithData{"f": []byte("other")}),
+		}),
+		Entry("set meta-data (initialize/not yet available)", testCaseSetBMHSpec{
+			MetaData: NewSecret("removed-secret", HostclaimNamespace),
+		}),
+		Entry("set image", testCaseSetBMHSpec{
+			SetImage: true,
+		}),
+		Entry("set custom deploy", testCaseSetBMHSpec{
+			SetCustomDeploy: true,
 		}),
 	)
 

@@ -28,6 +28,7 @@ import (
 
 	"github.com/go-logr/logr"
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
+	"github.com/metal3-io/baremetal-operator/pkg/secretutils"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -40,6 +41,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 type HostManager struct {
@@ -76,6 +78,8 @@ const (
 
 var (
 	associateBMHMutex sync.Mutex
+	// An error raised when BareMetalHost does not exists (only because go vet does not like returning nil, nil).
+	ErrNotFound = errors.New("NotFound")
 )
 
 func NewHostManager(client client.Client, log logr.Logger, host *metal3api.HostClaim, apireader client.Reader) (*HostManager, error) {
@@ -236,6 +240,123 @@ func (m *HostManager) ensureAnnotation(ctx context.Context, bmh *metal3api.BareM
 	bmhKey := cache.MetaObjectToName(bmh).String()
 	annotations[BareMetalHostAnnotation] = bmhKey
 	return m.PatchHost(ctx)
+}
+
+// setBmhSpec will ensure the host's Spec is set according to the machine's
+// details. It will then update the host via the kube API. If UserData does not
+// include a Namespace, it will default to the Host's namespace.
+func (m *HostManager) setBmhSpec(ctx context.Context, bmh *metal3api.BareMetalHost) error {
+	secretManager := secretutils.NewSecretManager(ctx, m.Log, m.client, m.APIReader)
+	ref, err := m.synchronizeDataSecret(ctx, secretManager, bmh, "userdata", m.HostClaim.Spec.UserData, m.HostClaim.Namespace, m.HostClaim.Name)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		m.SetConditionHostToFalse(
+			metal3api.SynchronizedCondition, metal3api.BadUserDataSecretReason, err.Error(),
+		)
+		return err
+	}
+	bmh.Spec.UserData = ref
+	ref, err = m.synchronizeDataSecret(ctx, secretManager, bmh, "metadata", m.HostClaim.Spec.MetaData, m.HostClaim.Namespace, m.HostClaim.Name)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		m.SetConditionHostToFalse(
+			metal3api.SynchronizedCondition, metal3api.BadMetaDataSecretReason, err.Error(),
+		)
+		return err
+	}
+	bmh.Spec.MetaData = ref
+	ref, err = m.synchronizeDataSecret(ctx, secretManager, bmh, "networkdata", m.HostClaim.Spec.NetworkData, m.HostClaim.Namespace, m.HostClaim.Name)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		m.SetConditionHostToFalse(
+			metal3api.SynchronizedCondition, metal3api.BadNetworkDataSecretReason, err.Error(),
+		)
+		return err
+	}
+	bmh.Spec.NetworkData = ref
+	// A host with an existing image is already provisioned and
+	// upgrades are not supported at this time. To re-provision a
+	// host, we must fully deprovision it and then provision it again.
+	if bmh.Spec.Image == nil && m.HostClaim.Spec.Image != nil {
+		bmh.Spec.Image = m.HostClaim.Spec.Image.DeepCopy()
+	} else if m.HostClaim.Spec.Image == nil {
+		bmh.Spec.Image = nil
+	}
+
+	// Propagate custom deploy.
+	if m.HostClaim.Spec.CustomDeploy == nil {
+		bmh.Spec.CustomDeploy = nil
+	} else {
+		bmh.Spec.CustomDeploy = &metal3api.CustomDeploy{Method: m.HostClaim.Spec.CustomDeploy.Method}
+	}
+
+	// Set automatedCleaningMode to disabled as long as the hostclaim exists
+	bmh.Spec.AutomatedCleaningMode = metal3api.CleaningModeDisabled
+
+	bmh.Spec.Online = m.HostClaim.Spec.PoweredOn
+	m.SetConditionHostToTrue(metal3api.SynchronizedCondition, metal3api.ConfigurationSyncedReason)
+	return nil
+}
+
+func (m *HostManager) synchronizeDataSecret(
+	ctx context.Context,
+	secretManager secretutils.SecretManager,
+	bmh *metal3api.BareMetalHost,
+	typ string,
+	sourceRef *corev1.SecretReference,
+	namespace string,
+	hostName string,
+) (*corev1.SecretReference, error) {
+	log := m.Log.WithValues("hostName", hostName, "hostNamespace", namespace, "secret-type", typ)
+	log.V(1).Info("Handling secret copy between claim and bmh")
+	secretName := bmh.Name + "-" + typ
+	if sourceRef == nil {
+		key := client.ObjectKey{Name: secretName, Namespace: bmh.Namespace}
+		targetSecret := corev1.Secret{}
+		err := m.client.Get(ctx, key, &targetSecret)
+		if err != nil {
+			if !k8serrors.IsNotFound(err) {
+				return nil, err
+			}
+			return nil, ErrNotFound
+		}
+		log.V(1).Info("no configuration secret in hostclaim: destroying in bmh")
+		err = m.client.Delete(ctx, &targetSecret)
+		return nil, err
+	}
+	// For the same reason as bmh, we ignore namespace value in the ref.
+	sourceKey := client.ObjectKey{Name: sourceRef.Name, Namespace: namespace}
+	sourceSecret, err := secretManager.AcquireSecret(sourceKey, m.HostClaim, false)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			log.Error(err, "Missing source Secret for synchronization from claim to BMH", "source", sourceKey)
+			return nil, &RequeueAfterError{RequeueAfter: HostClaimRequeueDelay}
+		}
+		log.Error(err, "Cannot get source Secret for synchronization from claim to BMH", "source", sourceKey)
+		return nil, err
+	}
+	log.V(1).Info("Updating bmh secret with hostclaim secret content")
+	targetSecret := corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: bmh.Namespace,
+		},
+	}
+	_, err = controllerutil.CreateOrUpdate(ctx, m.client, &targetSecret,
+		func() error {
+			if targetSecret.Labels == nil {
+				targetSecret.Labels = map[string]string{}
+			}
+			targetSecret.Labels[secretutils.LabelEnvironmentName] = secretutils.LabelEnvironmentValue
+			if err = controllerutil.SetOwnerReference(bmh, &targetSecret, m.client.Scheme()); err != nil {
+				return err
+			}
+			targetSecret.Data = sourceSecret.DeepCopy().Data
+			return nil
+		},
+	)
+	if err != nil {
+		log.Error(err, "cannot copy/update secret", "source", sourceKey, "target", secretName)
+		return nil, err
+	}
+	return &corev1.SecretReference{Name: secretName, Namespace: bmh.Namespace}, nil
 }
 
 // consumerRefMatches returns a boolean based on whether the consumer
