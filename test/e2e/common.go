@@ -1228,3 +1228,19 @@ func WaitForHostClaimDeleted(ctx context.Context, cli client.Client, hostClaim *
 		g.Expect(k8serrors.IsNotFound(err)).To(BeTrue())
 	}, intervals...).Should(Succeed())
 }
+
+func AnnotateHostClaim(ctx context.Context, client client.Client, claim *metal3api.HostClaim, key string, value *string) {
+	helper, err := patch.NewHelper(claim, client)
+	Expect(err).NotTo(HaveOccurred())
+	annotations := claim.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	if value == nil {
+		delete(annotations, key)
+	} else {
+		annotations[key] = *value
+	}
+	claim.SetAnnotations(annotations)
+	Expect(helper.Patch(ctx, claim)).To(Succeed())
+}
