@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -50,6 +51,10 @@ func setupScheme() *runtime.Scheme {
 }
 
 var _ = Describe("HostClaim manager", func() {
+
+	var (
+		defaultImage = metal3api.Image{URL: "url"}
+	)
 
 	type testCaseChooseBMH struct {
 		HostClaim          *metal3api.HostClaim
@@ -273,6 +278,77 @@ var _ = Describe("HostClaim manager", func() {
 			ExpectedBmhName: "bmh1",
 		}),
 	)
+
+	type testCaseAssociate struct {
+		HostClaim     *metal3api.HostClaim
+		ExpectFails   bool
+		ExpectRequeue bool
+	}
+
+	It("test hide conflict error",
+		func() {
+			ctx := context.TODO()
+			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable)
+			oldBmh := bmh.DeepCopy()
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(bmh).Build()
+			bmh.Spec.Description = "v0"
+			err := fakeClient.Update(ctx, bmh)
+			Expect(err).NotTo(HaveOccurred())
+			helper, err := patch.NewHelper(bmh, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			bmh.Spec.Description = "v1"
+			err = hideConflictError(helper.Patch(ctx, bmh))
+			Expect(err).NotTo(HaveOccurred(), "Patch succeeds")
+			helper, err = patch.NewHelper(oldBmh, fakeClient)
+			oldBmh.ResourceVersion = "234"
+			oldBmh.Spec.Description = "v2"
+			err = hideConflictError(helper.Patch(ctx, oldBmh))
+			Expect(err).To(HaveOccurred(), "Conflict error becomes requeue")
+			var requeueAfterError HasRequeueAfterError
+			Expect(errors.As(err, &requeueAfterError)).To(BeTrue())
+		})
+
+	DescribeTable("test Associate",
+		func(tc testCaseAssociate) {
+			sec := NewSecret("sec-user-data", HostclaimNamespace, WithData{"user-data": []byte("v")})
+			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable)
+			objects := []client.Object{
+				tc.HostClaim, bmh, sec,
+				NewHostdeploypolicy("hdp", "ns", AcceptNames{HostclaimNamespace}),
+				NewNamespace("hcNs"), NewNamespace("ns"),
+			}
+			// We patch the status during associate to set the annotation.
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objects...).WithStatusSubresource(tc.HostClaim).Build()
+			hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			err = hostMgr.Associate(context.TODO())
+			if tc.ExpectFails {
+				Expect(err).To(HaveOccurred())
+				var requeueAfterError HasRequeueAfterError
+				Expect(errors.As(err, &requeueAfterError)).To(Equal(tc.ExpectRequeue))
+				return
+			}
+			Expect(err).NotTo(HaveOccurred())
+		},
+		Entry("Regular case", testCaseAssociate{HostClaim: NewHostclaim(HostclaimName,
+			WithImage{Image: defaultImage},
+			WithUserData("sec-user-data"),
+		)}),
+		Entry("Bad Selector, True failure", testCaseAssociate{
+			HostClaim: NewHostclaim(HostclaimName,
+				WithMatchExprSelector{metal3api.HostSelectorRequirement{
+					Key: "k", Operator: selection.Exists, Values: []string{"a", "b"}}}),
+			ExpectFails: true,
+		}),
+		Entry("Incompatible selector", testCaseAssociate{
+			HostClaim: NewHostclaim(HostclaimName,
+				WithMatchExprSelector{metal3api.HostSelectorRequirement{
+					Key: "k", Operator: selection.Exists, Values: []string{}}}),
+			ExpectFails:   true,
+			ExpectRequeue: true,
+		}),
+	)
+
 })
 
 func TestManagers(t *testing.T) {

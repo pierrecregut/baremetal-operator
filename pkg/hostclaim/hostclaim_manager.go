@@ -23,12 +23,21 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-logr/logr"
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
+	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/cache"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -44,16 +53,29 @@ type HostManager struct {
 const (
 	// PausedAnnotationKey is an annotation to be used for pausing a hostclaim.
 	PausedAnnotationKey = "metal3.io/hostmgr"
+	// BareMetalHostAnnotation is the key for an annotation that should go on a Host to
+	// reference what BareMetalHost it corresponds to.
+	BareMetalHostAnnotation = "metal3.io/BareMetalHost"
 	// UnhealthyAnnotation is the annotation used by the Metal3Health
 	// that sets unhealthy status of BMH.
 	UnhealthyAnnotation = "capi.metal3.io/unhealthy"
 	// nodeReuseLabelName is the label set on BMH when node reuse feature is enabled.
 	// and the label set on HostClaim as target for reuse.
 	nodeReuseLabelName = "infrastructure.cluster.x-k8s.io/node-reuse"
+	// Requeueing after 0 is in fact not requeuing.
+	TerminalReueueDelay time.Duration = 0
+	// Standard delay when waiting for other to settle.
+	HostClaimRequeueDelay = time.Second * 30
+	// Small delay on conflict error.
+	ConflictRequeueDelay = time.Millisecond * 100
 	// FailureDomainLabelName is a label name for FailureDomains.
 	FailureDomainLabelName = "infrastructure.cluster.x-k8s.io/failure-domain"
 	// HostClaimKind is the name of the kind
 	HostClaimKind = "HostClaim"
+)
+
+var (
+	associateBMHMutex sync.Mutex
 )
 
 func NewHostManager(client client.Client, log logr.Logger, host *metal3api.HostClaim, apireader client.Reader) (*HostManager, error) {
@@ -68,6 +90,152 @@ func NewHostManager(client client.Client, log logr.Logger, host *metal3api.HostC
 		PatchHelper: patchHelper,
 		APIReader:   apireader,
 	}, nil
+}
+
+// SetConditionHostToFalse sets Host condition status to False.
+func (m *HostManager) SetConditionHostToFalse(
+	t string,
+	reason string,
+	message string,
+) {
+	conditions.Set(m.HostClaim, metav1.Condition{Type: t, Status: metav1.ConditionFalse, Reason: reason, Message: message})
+}
+
+// SetConditionHostToFalse sets Host condition status to False.
+func (m *HostManager) SetConditionHostToTrue(
+	t string,
+	reason string,
+) {
+	conditions.Set(m.HostClaim, metav1.Condition{Type: t, Status: metav1.ConditionTrue, Reason: reason, Message: ""})
+}
+
+func (m *HostManager) Associate(ctx context.Context) error {
+	// Parallel attempts to associate is problematic since the same BMH
+	// could be selected for multiple M3Ms. Therefore we use a mutex lock here.
+	associateBMHMutex.Lock()
+	defer associateBMHMutex.Unlock()
+
+	m.Log.Info("Associating host")
+
+	// load and validate the config
+	if m.HostClaim == nil {
+		// Should have been picked earlier. Do not requeue
+		m.Log.Info("No hostclaim in Associate")
+		return nil
+	}
+
+	bmh, helper, err := m.chooseBMH(ctx)
+	if err != nil {
+		if ok, _ := IsRequeueAfterError(err); !ok {
+			m.SetConditionHostToFalse(
+				metal3api.AssociatedCondition, metal3api.NoBareMetalHostReason,
+				"Failed to pick a BaremetalHost for the Host")
+		}
+		return err
+	}
+	if bmh == nil {
+		m.Log.Info("No available host found. Requeuing.")
+		m.SetConditionHostToFalse(
+			metal3api.AssociatedCondition, metal3api.NoBareMetalHostReason,
+			"No available host found: requeuing.")
+		return &RequeueAfterError{RequeueAfter: HostClaimRequeueDelay}
+	}
+	m.Log.Info("Associating machine with host", "BareMetalHost", bmh.Name)
+
+	// First we record the association in the BMH. If we fail, we must redo the
+	// whole selection process and remove the annotation.
+	m.setBmhConsumerRef(bmh)
+
+	if err = helper.Patch(ctx, bmh); err != nil {
+		m.Log.Error(err, "Error while patching the consumerRef on BMH")
+		delete(m.HostClaim.Annotations, BareMetalHostAnnotation)
+		m.SetConditionHostToFalse(
+			metal3api.AssociatedCondition, metal3api.BareMetalHostNotSynchronizedReason,
+			"Failed to set consumer Reference on BareMetalHost")
+		return hideConflictError(err)
+	}
+
+	// Then we record the commitment to this given BMH.
+	err = m.ensureAnnotation(ctx, bmh)
+	if err != nil {
+		m.SetConditionHostToFalse(
+			metal3api.AssociatedCondition, metal3api.HostClaimAnnotationNotSetReason,
+			"Failed to annotate the hostclaim")
+		return err
+	}
+
+	// From here the hostClaim is definitely associated
+	m.SetConditionHostToTrue(metal3api.AssociatedCondition, metal3api.BareMetalHostAssociatedReason)
+
+	return nil
+}
+
+// PatchHost patch the HostClaim and ensures that the conditions are initialized.
+// Can be used several times without creating a conflict.
+func (m *HostManager) PatchHost(ctx context.Context, options ...patch.Option) error {
+	if m.PatchHelper == nil {
+		m.Log.Info("Patch helper was removed")
+		return nil
+	}
+	// Always update the readyCondition by summarizing the state of other conditions.
+	sumOption := conditions.ForConditionTypes{
+		metal3api.AssociatedCondition, metal3api.SynchronizedCondition, metal3api.ProvisionedCondition}
+	if err := conditions.SetSummaryCondition(m.HostClaim, m.HostClaim, clusterv1.ReadyCondition, sumOption); err != nil {
+		return err
+	}
+
+	// Patch the object, ignoring conflicts on the conditions owned by this controller.
+	options = append(
+		options,
+		patch.WithOwnedConditions{Conditions: []string{
+			clusterv1.ReadyCondition,
+			metal3api.AssociatedCondition,
+			metal3api.SynchronizedCondition,
+			metal3api.ProvisionedCondition,
+			metal3api.AvailableCondition,
+		}},
+		patch.WithStatusObservedGeneration{},
+	)
+	err := m.PatchHelper.Patch(ctx, m.HostClaim, options...)
+	if err != nil {
+		// Deactivate pathHelper so that it cannot be reused
+		m.PatchHelper = nil
+	}
+	return err
+}
+
+func (m *HostManager) setBmhConsumerRef(bmh *metal3api.BareMetalHost) {
+	bmh.Spec.ConsumerRef = &corev1.ObjectReference{
+		Kind:       HostClaimKind,
+		Name:       m.HostClaim.Name,
+		Namespace:  m.HostClaim.Namespace,
+		APIVersion: metal3api.GroupVersion.Identifier(),
+	}
+}
+
+func hideConflictError(err error) error {
+	var aggr kerrors.Aggregate
+	if ok := errors.As(err, &aggr); ok {
+		for _, kerr := range aggr.Errors() {
+			if k8serrors.IsConflict(kerr) {
+				return &RequeueAfterError{RequeueAfter: ConflictRequeueDelay}
+			}
+		}
+	}
+	return err
+}
+
+// ensureAnnotation makes sure the machine has an annotation that references the
+// host and uses the API to update the machine if necessary.
+func (m *HostManager) ensureAnnotation(ctx context.Context, bmh *metal3api.BareMetalHost) error {
+	annotations := m.HostClaim.Annotations
+	if annotations == nil {
+		annotations = map[string]string{}
+		m.HostClaim.Annotations = annotations
+	}
+	bmhKey := cache.MetaObjectToName(bmh).String()
+	annotations[BareMetalHostAnnotation] = bmhKey
+	return m.PatchHost(ctx)
 }
 
 // consumerRefMatches returns a boolean based on whether the consumer
