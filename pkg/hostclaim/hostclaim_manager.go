@@ -68,6 +68,12 @@ const (
 	FailureDomainLabelName = "infrastructure.cluster.x-k8s.io/failure-domain"
 	// HostClaimKind is the name of the kind.
 	HostClaimKind = "HostClaim"
+	// RebootHostClaimOwnedPrefix is a prefix on the shortname of a reboot
+	// annotation on a BMH when it is owned by a HostClaim.
+	RebootHostClaimOwnedPrefix = "hostclaim-"
+
+	hostclaimRebootPrefix = metal3api.RebootAnnotationPrefix + "/"
+	bmhRebootPrefix       = hostclaimRebootPrefix + RebootHostClaimOwnedPrefix
 )
 
 var (
@@ -235,6 +241,14 @@ func (m *Manager) Delete(ctx context.Context) error {
 		bmhUpdated = true
 	}
 
+	// Remove reboot annotations owned by the claim
+	for key := range bmh.Annotations {
+		if strings.HasPrefix(key, bmhRebootPrefix) {
+			delete(bmh.Annotations, key)
+			bmhUpdated = true
+		}
+	}
+
 	if bmhUpdated {
 		if err = m.client.Update(ctx, bmh); err != nil {
 			return hideConflictError(err)
@@ -292,6 +306,14 @@ func (m *Manager) Update(ctx context.Context) error {
 	// ensure that the BMH specs are correctly set.
 	updated, imageMismatch := m.setBmhSpec(bmh)
 
+	if bmh.Annotations == nil {
+		bmh.Annotations = map[string]string{}
+	}
+
+	if syncReboot(m.HostClaim.Annotations, bmh.Annotations) {
+		updated = true
+	}
+
 	if updated {
 		m.Log.Info("Updating the BareMetalHost spec: changes detected.")
 		err = m.client.Update(ctx, bmh)
@@ -317,6 +339,13 @@ func (m *Manager) Update(ctx context.Context) error {
 	} else {
 		m.SetConditionHostToTrue(metal3api.SynchronizedCondition, metal3api.ConfigurationSyncedReason)
 	}
+
+	// transient rebootAnnotation was successfully transmitted. We can delete it on HostClaim.
+	// Note: if the deferred HostClaim patch fails, the annotation persists and
+	// may cause a second reboot at next reconciliation.
+	// This is preferred over losing the reboot request entirely if the claim was patched
+	// first.
+	delete(m.HostClaim.Annotations, metal3api.RebootAnnotationPrefix)
 
 	m.updateHostClaimStatus(bmh)
 
@@ -719,6 +748,49 @@ func (m *Manager) updateHostClaimStatus(bmh *metal3api.BareMetalHost) {
 		now := metav1.Now()
 		m.HostClaim.Status.LastUpdated = &now
 	}
+}
+
+// syncReboot mirrors reboot annotations from the HostClaim onto the BMH.
+//
+// When phased reboot annotations are propagated, they are prefixed with
+// RebootHostClaimOwnedPrefix.
+func syncReboot(hostMap, bmhMap map[string]string) bool {
+	updated := false
+
+	// Propagate deletions of phased reboot annotations:
+	// the prefix is used to limit the scope of the search
+	// for deletion candidates.
+	// Simple reboot annotations are deleted by the BMH controller once handled.
+	for key := range bmhMap {
+		if !strings.HasPrefix(key, bmhRebootPrefix) {
+			continue
+		}
+		hostKey := hostclaimRebootPrefix + strings.TrimPrefix(key, bmhRebootPrefix)
+		if _, ok := hostMap[hostKey]; !ok {
+			updated = true
+			delete(bmhMap, key)
+		}
+	}
+
+	// Propagate additions and updates.
+	for key, v := range hostMap {
+		switch {
+		case key == metal3api.RebootAnnotationPrefix:
+			// the annotation must be removed on the hostClaim but this is
+			// deferred until the bmh is updated.
+			if w, ok := bmhMap[key]; !ok || w != v {
+				updated = true
+				bmhMap[key] = v
+			}
+		case strings.HasPrefix(key, hostclaimRebootPrefix):
+			bmhKey := bmhRebootPrefix + strings.TrimPrefix(key, hostclaimRebootPrefix)
+			if bmhMap[bmhKey] != v {
+				updated = true
+				bmhMap[bmhKey] = v
+			}
+		}
+	}
+	return updated
 }
 
 type Set[T comparable] = map[T]struct{}

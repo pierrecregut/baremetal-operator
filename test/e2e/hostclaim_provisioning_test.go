@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/cluster-api/test/framework"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -233,6 +234,21 @@ var _ = Describe("Associate a hostclaim to a BMH and delete the claim.", Label("
 			} else {
 				Logf("WARNING: Skipping SSH check since SSH_CHECK_PROVISIONED != true")
 			}
+
+			By("setting the reboot annotation on the claim and checking that the BMH was rebooted")
+			AnnotateHostClaim(ctx, clusterProxy.GetClient(), hostClaim, metal3api.RebootAnnotationPrefix, ptr.To("{\"force\": true}"))
+
+			WaitForBmhInPowerState(ctx, WaitForBmhInPowerStateInput{
+				Client: clusterProxy.GetClient(),
+				Bmh:    *bmh,
+				State:  PoweredOff,
+			}, e2eConfig.GetIntervals(specName, "wait-power-state")...)
+
+			WaitForBmhInPowerState(ctx, WaitForBmhInPowerStateInput{
+				Client: clusterProxy.GetClient(),
+				Bmh:    *bmh,
+				State:  PoweredOn,
+			}, e2eConfig.GetIntervals(specName, "wait-power-state")...)
 
 			By("Deleting the hostclaim")
 			err = clusterProxy.GetClient().Delete(ctx, hostClaim)

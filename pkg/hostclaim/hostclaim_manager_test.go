@@ -19,6 +19,7 @@ package hostclaim
 import (
 	"context"
 	"errors"
+	"maps"
 	"testing"
 
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
@@ -512,6 +513,41 @@ var _ = Describe("HostClaim manager", func() {
 			Expect(conditions.IsTrue(hostClaim, metal3api.AvailableForProvisioningCondition)).To(BeTrue())
 		})
 
+	It("test syncReboot",
+		func() {
+			otherReboot := metal3api.RebootAnnotationPrefix + "/manual"
+			claimAnnot := metal3api.RebootAnnotationPrefix + "/test"
+			bmhAnnot := metal3api.RebootAnnotationPrefix + "/" + RebootHostClaimOwnedPrefix + "test"
+			annots := map[string]string{"a": "v1", otherReboot: "v2"}
+			saved := maps.Clone(annots)
+			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable).SetAnnotations(annots).Build()
+			// Phased reboot
+			hostClaim := NewHostclaim(HostclaimName).SetAnnotations(map[string]string{claimAnnot: "v0"}).SetAssociatedBMH("ns", "bmh").Build()
+			upd := syncReboot(hostClaim.Annotations, bmh.Annotations)
+			Expect(bmh.Annotations).To(HaveLen(3))
+			Expect(bmh.Annotations[bmhAnnot]).To(Equal("v0"))
+			Expect(bmh.Annotations[otherReboot]).To(Equal("v2"))
+			Expect(upd).To(BeTrue())
+			// idempotence
+			upd = syncReboot(hostClaim.Annotations, bmh.Annotations)
+			Expect(upd).To(BeFalse())
+			// Remove reboot Annotation on the HostClaim.
+			delete(hostClaim.Annotations, claimAnnot)
+			upd = syncReboot(hostClaim.Annotations, bmh.Annotations)
+			Expect(maps.Equal(bmh.Annotations, saved)).To(BeTrue())
+			Expect(upd).To(BeTrue())
+			// idempotence
+			upd = syncReboot(hostClaim.Annotations, bmh.Annotations)
+			Expect(upd).To(BeFalse())
+			// simple reboot
+			hostClaim.Annotations[metal3api.RebootAnnotationPrefix] = "v3"
+			upd = syncReboot(hostClaim.Annotations, bmh.Annotations)
+			Expect(upd).To(BeTrue(), "transient reboot propagated")
+			saved[metal3api.RebootAnnotationPrefix] = "v3"
+			Expect(maps.Equal(bmh.Annotations, saved)).To(BeTrue())
+		},
+	)
+
 	type testCaseUpdate struct {
 		HostClaim              *metal3api.HostClaim
 		BareMetalHost          *metal3api.BareMetalHost
@@ -638,6 +674,29 @@ var _ = Describe("HostClaim manager", func() {
 			ExpectClear:      true,
 		}),
 	)
+
+	It("test Update clears reboot annotation on hostClaim after success",
+		func() {
+			ctx := context.TODO()
+			hc := NewHostclaim(HostclaimName).
+				SetAnnotations(map[string]string{metal3api.RebootAnnotationPrefix: ""}).
+				SetAssociatedBMH("ns", "bmh").Build()
+			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable).SetConsumerRef(defaultConsumerRef).Build()
+			objects := []client.Object{
+				hc, bmh,
+				NewHostdeploypolicy("hdp", "ns").AcceptNames([]string{HostclaimNamespace}).Build(),
+				NewNamespace("hcNs").Build(), NewNamespace("ns").Build(),
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objects...).Build()
+			hostMgr := NewManager(fakeClient, GinkgoLogr, hc, fakeClient)
+			Expect(hostMgr.Update(ctx)).To(Succeed())
+			_, present := hc.Annotations[metal3api.RebootAnnotationPrefix]
+			Expect(present).To(BeFalse(), "reboot annotation was consumed from the hostClaim")
+			bmhOut := &metal3api.BareMetalHost{}
+			Expect(fakeClient.Get(ctx, client.ObjectKeyFromObject(bmh), bmhOut)).To(Succeed())
+			_, present = bmhOut.Annotations[metal3api.RebootAnnotationPrefix]
+			Expect(present).To(BeTrue(), "reboot annotation was mirrored on the BMH")
+		})
 
 	type testCaseDelete struct {
 		HostClaim           *metal3api.HostClaim
