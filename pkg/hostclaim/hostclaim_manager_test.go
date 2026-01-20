@@ -20,6 +20,7 @@ package hostclaim
 
 import (
 	"context"
+	"maps"
 	"reflect"
 	"strings"
 	"testing"
@@ -33,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -487,6 +489,72 @@ var _ = Describe("HostClaim manager", func() {
 		Entry("set custom deploy", testCaseSetBMHSpec{
 			SetCustomDeploy: true,
 		}),
+	)
+
+	DescribeTable("Test updateHostClaimStatus",
+		func(state metal3api.ProvisioningState, provisionned, available bool) {
+			hostClaim := NewHostclaim(
+				HostclaimName,
+				WithAnnotations{BareMetalHostAnnotation: "ns/bmh"},
+			)
+			bmh := NewBaremetalhost("bmh", "ns", state)
+			bmh.Status.PoweredOn = true
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).Build()
+			hostMgr, err := NewHostManager(fakeClient, GinkgoLogr, hostClaim, fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			hostMgr.updateHostClaimStatus(bmh)
+			Expect(hostClaim.Status.PoweredOn).To(BeTrue())
+			Expect(hostClaim.Status.HardwareData).NotTo(BeNil())
+			Expect(hostClaim.Status.HardwareData.Name).To(Equal("bmh"))
+			Expect(hostClaim.Status.HardwareData.Namespace).To(Equal("ns"))
+			if provisionned {
+				Expect(conditions.IsTrue(hostClaim, metal3api.ProvisionedCondition)).To(BeTrue())
+			} else {
+				Expect(conditions.IsFalse(hostClaim, metal3api.ProvisionedCondition)).To(BeTrue())
+			}
+			if available {
+				Expect(conditions.IsTrue(hostClaim, metal3api.AvailableCondition)).To(BeTrue())
+			} else {
+				Expect(conditions.IsFalse(hostClaim, metal3api.AvailableCondition)).To(BeTrue())
+			}
+
+		},
+		Entry("provisioned", metal3api.StateProvisioned, true, false),
+		Entry("available", metal3api.StateAvailable, false, true),
+		Entry("provisioning", metal3api.StateProvisioning, false, false),
+		Entry("inspecting", metal3api.StateInspecting, false, false),
+		Entry("other bmh state", metal3api.StateDeprovisioning, false, false),
+	)
+
+	It("test syncReboot",
+		func() {
+			opt := map[string]string{"a": "w1"}
+			saved := maps.Clone(opt)
+			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable, WithAnnotations(opt))
+			annot := rebootDomain + "/test"
+			hostClaim := NewHostclaim(
+				HostclaimName,
+				WithAnnotations{BareMetalHostAnnotation: "ns/bmh"},
+			)
+			hostClaim.Annotations[annot] = "v0"
+			syncReboot(hostClaim.Annotations, bmh.Annotations)
+			Expect(bmh.Annotations[annot]).To(Equal("v0"))
+			// Remove reboot/stop Annotation
+			delete(hostClaim.Annotations, annot)
+			syncReboot(hostClaim.Annotations, bmh.Annotations)
+			Expect(maps.Equal(bmh.Annotations, saved)).To(BeTrue())
+			// Set transient reboot. Propagation erase it.
+			hostClaim.Annotations[rebootDomain] = "v1"
+			syncReboot(hostClaim.Annotations, bmh.Annotations)
+			_, ok := hostClaim.Annotations[rebootDomain]
+			Expect(ok).To(BeFalse())
+			// Check reboot propagated to save
+			if saved == nil {
+				saved = map[string]string{}
+			}
+			saved[rebootDomain] = "v1"
+			Expect(maps.Equal(bmh.Annotations, saved)).To(BeTrue())
+		},
 	)
 
 })

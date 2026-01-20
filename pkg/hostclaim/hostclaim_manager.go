@@ -31,6 +31,7 @@ import (
 	"github.com/metal3-io/baremetal-operator/pkg/secretutils"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -64,6 +65,8 @@ const (
 	// nodeReuseLabelName is the label set on BMH when node reuse feature is enabled.
 	// and the label set on HostClaim as target for reuse.
 	nodeReuseLabelName = "infrastructure.cluster.x-k8s.io/node-reuse"
+	// rebootDomain is the domain of metal3 reboot annotations.
+	rebootDomain = "reboot.metal3.io"
 	// Requeueing after 0 is in fact not requeuing.
 	TerminalReueueDelay time.Duration = 0
 	// Standard delay when waiting for other to settle.
@@ -633,6 +636,69 @@ func (m *HostManager) chooseBMH(ctx context.Context) (*metal3api.BareMetalHost, 
 
 	helper, err := patch.NewHelper(chosenHost, m.client)
 	return chosenHost, helper, err
+}
+
+// updateHostClaimStatus updates the status of the HostClaim with information from BareMetalHost
+func (m *HostManager) updateHostClaimStatus(bmh *metal3api.BareMetalHost) {
+	hostOld := m.HostClaim.Status.DeepCopy()
+
+	// synchronize power status
+	m.HostClaim.Status.PoweredOn = bmh.Status.PoweredOn
+	m.HostClaim.Status.HardwareData = &metal3api.HardwareReference{
+		Namespace: bmh.Namespace,
+		Name:      bmh.Name,
+	}
+	switch bmh.Status.Provisioning.State {
+	case metal3api.StateAvailable:
+		m.SetConditionHostToTrue(metal3api.AvailableCondition, metal3api.AvailableReason)
+		m.SetConditionHostToFalse(metal3api.ProvisionedCondition, metal3api.NotProvisionedReason, "")
+	case metal3api.StateInspecting:
+		m.SetConditionHostToFalse(metal3api.AvailableCondition, metal3api.InspectingReason, "")
+		m.SetConditionHostToFalse(metal3api.ProvisionedCondition, metal3api.NotProvisionedReason, "")
+	case metal3api.StateProvisioned:
+		m.SetConditionHostToFalse(metal3api.AvailableCondition, metal3api.NotAvailableReason, "")
+		m.SetConditionHostToTrue(metal3api.ProvisionedCondition, metal3api.ProvisionedReason)
+	case metal3api.StateProvisioning:
+		m.SetConditionHostToFalse(metal3api.AvailableCondition, metal3api.NotAvailableReason, "")
+		m.SetConditionHostToFalse(metal3api.ProvisionedCondition, metal3api.ProvisioningReason, "")
+	default:
+		m.SetConditionHostToFalse(metal3api.AvailableCondition, metal3api.NotAvailableReason, "")
+		m.SetConditionHostToFalse(metal3api.ProvisionedCondition, metal3api.NotProvisionedReason, "")
+	}
+
+	m.SetConditionHostToTrue(metal3api.AssociatedCondition, metal3api.BareMetalHostAssociatedReason)
+
+	if !equality.Semantic.DeepEqual(m.HostClaim.Status, hostOld) {
+		now := metav1.Now()
+		m.HostClaim.Status.LastUpdated = &now
+	}
+}
+
+// Transfer elements from argument bmhMap to hostMap and deletes the elements from
+// hostMap whose key is in synced and do not appear in bmhMap. The result of the
+// function is the comma separated names of keys from bmhMap.
+func syncReboot(hostMap, bmhMap map[string]string) {
+	for key := range bmhMap {
+		elts := strings.Split(key, "/")
+		// Propagates down unless it is just reboot and already propagated.
+		if elts[0] == rebootDomain && len(elts) == 2 {
+			if _, ok := hostMap[key]; !ok {
+				delete(bmhMap, key)
+			}
+		}
+	}
+
+	// We propagate reboot annotations to the bmh when it appears.
+	for key, v := range hostMap {
+		elts := strings.Split(key, "/")
+		// Propagates down unless it is just reboot and already propagated.
+		if elts[0] == rebootDomain {
+			bmhMap[key] = v
+			if len(elts) == 1 {
+				delete(hostMap, key)
+			}
+		}
+	}
 }
 
 // nodeReuseLabelExists returns true if host contains nodeReuseLabelName label.
