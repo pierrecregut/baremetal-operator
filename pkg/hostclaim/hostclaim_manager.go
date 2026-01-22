@@ -397,12 +397,6 @@ func (m *HostManager) Delete(ctx context.Context) error {
 
 		onlineStatus := bmh.Spec.Online
 
-		// We force Cleaning when the hostClaim is deleted.
-		if bmh.Spec.AutomatedCleaningMode != metal3api.CleaningModeMetadata {
-			bmhUpdated = true
-			bmh.Spec.AutomatedCleaningMode = metal3api.CleaningModeMetadata
-		}
-
 		switch Capm3FastTrack {
 		case "true":
 			bmh.Spec.Online = true
@@ -449,6 +443,7 @@ func (m *HostManager) Delete(ctx context.Context) error {
 			delete(bmh.Annotations, metal3api.PausedAnnotation)
 		}
 
+		bmh.Spec.ConsumerOverride = nil
 		// ConsumerRef removed last. Made atomic with next step.
 		bmh.Spec.ConsumerRef = nil
 
@@ -627,7 +622,10 @@ func (m *HostManager) setBmhSpec(ctx context.Context, bmh *metal3api.BareMetalHo
 	}
 
 	// Set automatedCleaningMode to disabled as long as the hostclaim exists
-	bmh.Spec.AutomatedCleaningMode = metal3api.CleaningModeDisabled
+	cleaningMode := metal3api.CleaningModeDisabled
+	bmh.Spec.ConsumerOverride = &metal3api.ConsumerOverride{
+		AutomatedCleaningMode: &cleaningMode,
+	}
 
 	bmh.Spec.Online = m.HostClaim.Spec.PoweredOn
 	m.SetConditionHostToTrue(metal3api.SynchronizedCondition, metal3api.ConfigurationSyncedReason)
