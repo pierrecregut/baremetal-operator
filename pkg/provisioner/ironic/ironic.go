@@ -1070,6 +1070,17 @@ func buildFirmwareSettings(settings []map[string]any, name string, value intstr.
 	return settings
 }
 
+func (p *ironicProvisioner) startAutomaticCleaning(ctx context.Context, ironicNode *nodes.Node) (success bool, result provisioner.Result, err error) {
+	p.log.Info("performs an automatic cleaning pass")
+	return p.tryChangeNodeProvisionState(
+		ctx,
+		ironicNode,
+		nodes.ProvisionStateOpts{
+			Target: nodes.TargetProvide,
+		},
+	)
+}
+
 func (p *ironicProvisioner) startManualCleaning(ctx context.Context, bmcAccess bmc.AccessDetails, ironicNode *nodes.Node, data provisioner.PrepareData) (success bool, result provisioner.Result, err error) {
 	// Set raid configuration
 	result, err = setTargetRAIDCfg(ctx, p, bmcAccess.RAIDInterface(), ironicNode, data)
@@ -1118,6 +1129,13 @@ func (p *ironicProvisioner) Prepare(ctx context.Context, data provisioner.Prepar
 	switch nodes.ProvisionState(ironicNode.ProvisionState) {
 	case nodes.Available:
 		if unprepared {
+			if data.CleaningRequested {
+				result, err = p.changeNodeProvisionState(
+					ctx, ironicNode,
+					nodes.ProvisionStateOpts{Target: nodes.TargetManage},
+				)
+				return result, started, err
+			}
 			var cleanSteps []nodes.CleanStep
 			cleanSteps, err = p.buildManualCleaningSteps(bmcAccess, data)
 			if err != nil {
@@ -1140,7 +1158,11 @@ func (p *ironicProvisioner) Prepare(ctx context.Context, data provisioner.Prepar
 
 	case nodes.Manageable:
 		if unprepared {
-			started, result, err = p.startManualCleaning(ctx, bmcAccess, ironicNode, data)
+			if data.CleaningRequested {
+				started, result, err = p.startAutomaticCleaning(ctx, ironicNode)
+			} else {
+				started, result, err = p.startManualCleaning(ctx, bmcAccess, ironicNode, data)
+			}
 			if started || result.Dirty || result.ErrorMessage != "" || err != nil {
 				return result, started, err
 			}
