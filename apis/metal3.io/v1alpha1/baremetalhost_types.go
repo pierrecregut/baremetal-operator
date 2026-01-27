@@ -140,23 +140,64 @@ const (
 )
 
 const (
-	// ProvisionedCondition documents the provisioning state of the BareMetalHost toward the Provisioned goal.
+	// ManageableCondition documents the registration of the BareMetalHost.
+	ManageableCondition = "Manageable"
+	// ManagedReason is the reason used when the BareMetalHost is registered and
+	// there is no power fault.
+	ManagedReason = "Managed"
+	// NotManagedReason is the reason used when the BareMetalHost is not
+	// registered.
+	NotManagedReason = "NotManaged"
+
+	// ProvisionedCondition documents the provisioning state of the BareMetalHost
+	// toward the Provisioned goal.
 	ProvisionedCondition = "Provisioned"
-	// ProvisionedReason is the reason used when the BareMetalHost is provisioned.
+	// ProvisionedReason is the reason used by the Provisioned and the Ready conditions
+	// when the BareMetalHost is provisioned.
 	ProvisionedReason = "Provisioned"
 	// ProvisionedReason is the reason used when the BareMetalHost is not provisioned and not provisioning.
 	NotProvisionedReason = "NotProvisioned"
 	// ProvisionedReason is the reason used when the BareMetalHost is provisioning.
 	ProvisioningReason = "Provisioning"
 
-	// AvailableCondition documents the provisioning state of the BareMetalHost toward the Available state.
+	// ReadyCondition documents the fact that the BareMetalHost is provisioned and in a good
+	// operational status.
+	ReadyCondition = "Ready"
+	// ErrorCondition is the reason used when the operational state is in error
+	ErrorReason = "Error"
+	// Servicing si the reason used when the host is servicing
+	ServicingReason = "Servicing"
+	// AvailableCondition documents the availability of the BareMetalHost toward the Available state.
 	AvailableCondition = "Available"
 	// AvailableReason is the reason used when the BareMetalHost is in available state.
 	AvailableReason = "Available"
 	// NotAvailableReason is the reason used when the BareMetalHost is not available and not inspecting.
 	NotAvailableReason = "NotAvailable"
-	// InspectingReason is the reason used when the BareMetalHost is reinspected.
+	// InspectingReason is the reason used for the Available condition
+	// when the BareMetalHost is reinspected or for the Progressing condition.
 	InspectingReason = "Inspecting"
+
+	// ProgressingCondition documents the fact that the BareMetalHost is in
+	// an intermediate step progressing toward a stable state.
+	ProgressingCondition = "Progressing"
+	// RegisteringReason is the reason used for the ProgressingCondition when
+	// the BareMetalHost is registering.
+	RegisteringReason = "Registering"
+	// PreparingReason is the reason used for the ProgressingCondition when
+	// the BareMetalHost is registering.
+	PreparingReason = "Preparing"
+	// DeprovisioningReason is the reason used for the ProgressingCondition when
+	// the BareMetalHost is registering.
+	DeprovisioningReason = "Deprovisioning"
+	// PoweringOffBeforeDeleteReason is the reason used for the ProgressingCondition when
+	// the BareMetalHost is registering.
+	PoweringOffBeforeDeleteReason = "PoweringOffBeforeDelete"
+	// DeletingReason is the reason used for the ProgressingCondition when
+	// the BareMetalHost is registering.
+	DeletingReason = "Deleting"
+	// NotProgressingReason is the reason used when the BareMetalHost is in
+	// a stable state.
+	NotProgressingReason = "NotProgressing"
 )
 
 // OperationalStatus represents the state of the host.
@@ -932,6 +973,10 @@ type BareMetalHostStatus struct {
 	// ErrorCount records how many times the host has encoutered an error since the last successful operation
 	// +kubebuilder:default:=0
 	ErrorCount int `json:"errorCount"`
+
+	// Conditions defines current service state of the BareMetalHost.
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // ProvisionStatus holds the state information for a single target.
@@ -984,6 +1029,16 @@ type BareMetalHost struct {
 
 	Spec   BareMetalHostSpec   `json:"spec,omitempty"`
 	Status BareMetalHostStatus `json:"status,omitempty"`
+}
+
+// GetConditions returns the set of conditions for this object.
+func (host *BareMetalHost) GetConditions() []metav1.Condition {
+	return host.Status.Conditions
+}
+
+// SetConditions sets conditions for an API object.
+func (host *BareMetalHost) SetConditions(conditions []metav1.Condition) {
+	host.Status.Conditions = conditions
 }
 
 // BootMode returns the boot method to use for the host.
