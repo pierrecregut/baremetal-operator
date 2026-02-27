@@ -471,6 +471,8 @@ func (m *HostManager) Delete(ctx context.Context) error {
 			}
 		}
 
+		bmh.Spec.ConsumerOverride = nil
+		// ConsumerRef removed last. Made atomic with next step.
 		bmh.Spec.ConsumerRef = nil
 		if err := m.client.Update(ctx, bmh); err != nil {
 			return err
@@ -585,6 +587,16 @@ func (m *HostManager) setBmhSpec(ctx context.Context, bmh *metal3api.BareMetalHo
 		} else if bmh.Spec.CustomDeploy.Method != m.HostClaim.Spec.CustomDeploy.Method {
 			updated = true
 			bmh.Spec.CustomDeploy.Method = m.HostClaim.Spec.CustomDeploy.Method
+		}
+	}
+
+	// Disable cleaning
+	if bmh.Spec.ConsumerOverride == nil || bmh.Spec.ConsumerOverride.AutomatedCleaningMode == nil ||
+		*bmh.Spec.ConsumerOverride.AutomatedCleaningMode != metal3api.CleaningModeDisabled {
+		updated = true
+		disabled := metal3api.CleaningModeDisabled
+		bmh.Spec.ConsumerOverride = &metal3api.ConsumerOverride{
+			AutomatedCleaningMode: &disabled,
 		}
 	}
 

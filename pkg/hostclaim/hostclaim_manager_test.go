@@ -597,6 +597,7 @@ var _ = Describe("HostClaim manager", func() {
 		SetImage        bool
 		SetCustomDeploy bool
 		SetPoweredOn    bool
+		DisableCleaning bool
 		Updated         bool
 	}
 
@@ -646,6 +647,9 @@ var _ = Describe("HostClaim manager", func() {
 			if tc.BMHNetworkData != nil {
 				bmhBuilder = bmhBuilder.SetNetworkData(tc.BMHNetworkData.Name)
 				objects = append(objects, tc.BMHNetworkData)
+			}
+			if tc.DisableCleaning {
+				bmhBuilder = bmhBuilder.SetCleaningModeOverride(metal3api.CleaningModeDisabled)
 			}
 			bmh := bmhBuilder.Build()
 			objects = append(objects, hostClaim, bmh)
@@ -701,8 +705,9 @@ var _ = Describe("HostClaim manager", func() {
 			Updated:  true,
 		}),
 		Entry("set user-data (override)", testCaseSetBMHSpec{
-			UserData:    NewSecret("s1", HostclaimNamespace).SetData(map[string][]byte{"f": []byte("udt")}).Build(),
-			BMHUserData: NewSecret("bmh-userdata", "ns").SetData(map[string][]byte{"f": []byte("other")}).Build(),
+			UserData:        NewSecret("s1", HostclaimNamespace).SetData(map[string][]byte{"f": []byte("udt")}).Build(),
+			BMHUserData:     NewSecret("bmh-userdata", "ns").SetData(map[string][]byte{"f": []byte("other")}).Build(),
+			DisableCleaning: true,
 		}),
 		Entry("reset user-data (override)", testCaseSetBMHSpec{
 			BMHUserData: NewSecret("bmh-userdata", "ns").SetData(map[string][]byte{"f": []byte("other")}).Build(),
@@ -714,10 +719,11 @@ var _ = Describe("HostClaim manager", func() {
 			Updated:     true,
 		}),
 		Entry("set meta-data/network-data (override)", testCaseSetBMHSpec{
-			MetaData:       NewSecret("s1", HostclaimNamespace).SetData(map[string][]byte{"f": []byte("mdt")}).Build(),
-			NetworkData:    NewSecret("s2", HostclaimNamespace).SetData(map[string][]byte{"f": []byte("nwdt")}).Build(),
-			BMHMetaData:    NewSecret("bmh-metadata", "ns").SetData(map[string][]byte{"f": []byte("other")}).Build(),
-			BMHNetworkData: NewSecret("bmh-networkdata", "ns").SetData(map[string][]byte{"f": []byte("other")}).Build(),
+			MetaData:        NewSecret("s1", HostclaimNamespace).SetData(map[string][]byte{"f": []byte("mdt")}).Build(),
+			NetworkData:     NewSecret("s2", HostclaimNamespace).SetData(map[string][]byte{"f": []byte("nwdt")}).Build(),
+			BMHMetaData:     NewSecret("bmh-metadata", "ns").SetData(map[string][]byte{"f": []byte("other")}).Build(),
+			BMHNetworkData:  NewSecret("bmh-networkdata", "ns").SetData(map[string][]byte{"f": []byte("other")}).Build(),
+			DisableCleaning: true,
 		}),
 		Entry("reset meta-data/network-data (override)", testCaseSetBMHSpec{
 			BMHMetaData:    NewSecret("bmh-metadata", "ns").SetData(map[string][]byte{"f": []byte("other")}).Build(),

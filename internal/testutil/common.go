@@ -161,6 +161,14 @@ func (bb *BareMetalHostBuilder) SetCleaningMode(cmode metal3api.AutomatedCleanin
 	return bb
 }
 
+func (bb *BareMetalHostBuilder) SetCleaningModeOverride(cmode metal3api.AutomatedCleaningMode) *BareMetalHostBuilder {
+	if bb.bmh.Spec.ConsumerOverride == nil {
+		bb.bmh.Spec.ConsumerOverride = &metal3api.ConsumerOverride{}
+	}
+	bb.bmh.Spec.ConsumerOverride.AutomatedCleaningMode = &cmode
+	return bb
+}
+
 func (bb *BareMetalHostBuilder) SetCustomDeploy(cd string) *BareMetalHostBuilder {
 	bb.bmh.Spec.CustomDeploy = &metal3api.CustomDeploy{Method: cd}
 	return bb
