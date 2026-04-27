@@ -25,6 +25,20 @@ type HostDeployPolicySpec struct {
 	// HostClaimNamespaces constrains the namespaces of the HostClaims allowed
 	// to bind the BareMetalHosts in the same namespace as the HostDeployPolicy
 	HostClaimNamespaces *HostClaimNamespaces `json:"hostClaimNamespaces,omitempty"`
+	// Capabilities optionally grants additional capabilities to HostClaims
+	// matched by this policy, beyond the implicit permission to bind a
+	// BareMetalHost in the policy's namespace.
+	// +optional
+	Capabilities *HostClaimCapabilities `json:"capabilities,omitempty"`
+}
+
+// HostClaimCapabilities enumerates the capabilities a matched HostClaim
+// may exercise on BareMetalHosts in this policy's namespace.
+type HostClaimCapabilities struct {
+	// AllowsDetaching lets the HostClaim set the detached annotation
+	// of the BareMetalHost.
+	// +optional
+	AllowsDetaching bool `json:"allowsDetaching,omitempty"`
 }
 
 type HostClaimNamespaces struct {
