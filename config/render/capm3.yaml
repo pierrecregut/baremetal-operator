@@ -2726,6 +2726,18 @@ spec:
           spec:
             description: HostDeployPolicySpec defines the desired state of HostDeployPolicy.
             properties:
+              capabilities:
+                description: |-
+                  Capabilities optionally grants additional capabilities to HostClaims
+                  matched by this policy, beyond the implicit permission to bind a
+                  BareMetalHost in the policy's namespace.
+                properties:
+                  allowsDetaching:
+                    description: |-
+                      AllowsDetaching lets the HostClaim set the detached annotation
+                      of the BareMetalHost.
+                    type: boolean
+                type: object
               hostClaimNamespaces:
                 description: |-
                   HostClaimNamespaces constrains the namespaces of the HostClaims allowed

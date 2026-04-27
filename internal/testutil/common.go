@@ -370,3 +370,11 @@ func (hb *HostDeployPolicyBuilder) AcceptRegexp(re string) *HostDeployPolicyBuil
 	spec.HostClaimNamespaces.NameMatches = re
 	return hb
 }
+
+func (hb *HostDeployPolicyBuilder) AllowsDetaching() *HostDeployPolicyBuilder {
+	if hb.hostDeployPolicy.Spec.Capabilities == nil {
+		hb.hostDeployPolicy.Spec.Capabilities = &metal3api.HostClaimCapabilities{}
+	}
+	hb.hostDeployPolicy.Spec.Capabilities.AllowsDetaching = true
+	return hb
+}

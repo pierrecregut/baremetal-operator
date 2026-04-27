@@ -548,6 +548,67 @@ var _ = Describe("HostClaim manager", func() {
 		},
 	)
 
+	type testCaseSyncDetach struct {
+		AcceptHostClaimNs string
+		InHostClaimAnnot  string
+		InBmhAnnot        string
+		OutHostClaimAnnot string
+		OutBmhAnnot       string
+		Updated           bool
+	}
+
+	DescribeTable("test syncDetach",
+		func(tc testCaseSyncDetach) {
+			ctx := context.TODO()
+			ns := NewNamespace(HostclaimNamespace).Build()
+
+			annotHc := map[string]string{}
+			annotBmh := map[string]string{}
+			if tc.InHostClaimAnnot != "" {
+				annotHc = map[string]string{metal3api.DetachedAnnotation: tc.InHostClaimAnnot}
+			}
+			if tc.InBmhAnnot != "" {
+				annotBmh = map[string]string{metal3api.DetachedAnnotation: tc.InBmhAnnot}
+			}
+
+			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable).SetAnnotations(annotBmh).SetConsumerRef(defaultConsumerRef).Build()
+			hostClaim := NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").SetAnnotations(annotHc).Build()
+			hdp := NewHostdeploypolicy("hdp", "ns").AcceptNames([]string{tc.AcceptHostClaimNs}).AllowsDetaching().Build()
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(bmh, hostClaim, ns, hdp).Build()
+			hostMgr, ok := NewManager(fakeClient, GinkgoLogr, hostClaim, fakeClient).(*Manager)
+			Expect(ok).To(BeTrue())
+			updated, err := hostMgr.syncDetached(ctx, "ns", hostClaim.Annotations, bmh.Annotations)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updated).To(Equal(tc.Updated))
+			outBmhAnnot := ""
+			if bmh.Annotations != nil {
+				outBmhAnnot = bmh.Annotations[metal3api.DetachedAnnotation]
+			}
+			Expect(outBmhAnnot).To(Equal(tc.OutBmhAnnot))
+		},
+		Entry("not allowed", testCaseSyncDetach{AcceptHostClaimNs: "other", InHostClaimAnnot: "{}", OutBmhAnnot: ""}),
+		Entry("allowed",
+			testCaseSyncDetach{
+				AcceptHostClaimNs: HostclaimNamespace, InHostClaimAnnot: "{}", OutBmhAnnot: "{\"setByHostClaim\":true}", Updated: true}),
+		Entry("sanitize",
+			testCaseSyncDetach{
+				AcceptHostClaimNs: HostclaimNamespace,
+				InHostClaimAnnot:  "{\"deleteAction\": \"delay\"}",
+				OutBmhAnnot:       "{\"deleteAction\":\"delay\",\"setByHostClaim\":true}",
+				Updated:           true}),
+		Entry("no override",
+			testCaseSyncDetach{AcceptHostClaimNs: HostclaimNamespace, InHostClaimAnnot: "{}",
+				InBmhAnnot: "zzz", OutBmhAnnot: "zzz"}),
+		Entry("delete",
+			testCaseSyncDetach{
+				AcceptHostClaimNs: HostclaimNamespace, InHostClaimAnnot: "",
+				InBmhAnnot: "{\"setByHostClaim\": true}", OutBmhAnnot: "", Updated: true}),
+		Entry("no delete",
+			testCaseSyncDetach{
+				AcceptHostClaimNs: HostclaimNamespace, InHostClaimAnnot: "",
+				InBmhAnnot: "{}", OutBmhAnnot: "{}"}),
+	)
+
 	type testCaseUpdate struct {
 		HostClaim              *metal3api.HostClaim
 		BareMetalHost          *metal3api.BareMetalHost
