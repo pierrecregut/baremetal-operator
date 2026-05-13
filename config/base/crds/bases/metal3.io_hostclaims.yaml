@@ -206,12 +206,7 @@ spec:
                     description: name is unique within a namespace to reference a
                       secret resource.
                     type: string
-                  namespace:
-                    description: namespace defines the space within which the secret
-                      name must be unique.
-                    type: string
                 type: object
-                x-kubernetes-map-type: atomic
               networkData:
                 description: |-
                   NetworkData holds the reference to the Secret containing network
@@ -222,12 +217,7 @@ spec:
                     description: name is unique within a namespace to reference a
                       secret resource.
                     type: string
-                  namespace:
-                    description: namespace defines the space within which the secret
-                      name must be unique.
-                    type: string
                 type: object
-                x-kubernetes-map-type: atomic
               poweredOn:
                 description: |-
                   Should the compute resource be powered on? Changing this value will trigger
@@ -244,12 +234,7 @@ spec:
                     description: name is unique within a namespace to reference a
                       secret resource.
                     type: string
-                  namespace:
-                    description: namespace defines the space within which the secret
-                      name must be unique.
-                    type: string
                 type: object
-                x-kubernetes-map-type: atomic
             required:
             - poweredOn
             type: object
