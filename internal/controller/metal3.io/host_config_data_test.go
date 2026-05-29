@@ -171,9 +171,11 @@ func TestProvisionWithHostConfig(t *testing.T) {
 	testCases := []struct {
 		Scenario                           string
 		Host                               *metal3api.BareMetalHost
+		HostClaim                          *metal3api.HostClaim
 		UserDataSecret                     *corev1.Secret
 		PreprovNetworkDataSecret           *corev1.Secret
 		NetworkDataSecret                  *corev1.Secret
+		MetaDataSecret                     *corev1.Secret
 		ExpectedUserData                   string
 		ErrUserData                        bool
 		ExpectedNetworkData                string
@@ -471,6 +473,118 @@ func TestProvisionWithHostConfig(t *testing.T) {
 			ExpectedPreprovisioningNetworkData: "",
 			ErrPreprovisioningNetworkData:      false, // Should NOT error, should return empty
 		},
+		{
+			Scenario: "host with user data only through hostclaim",
+			Host: newHost("host-user-data",
+				&metal3api.BareMetalHostSpec{
+					BMC: metal3api.BMCDetails{
+						Address:         "ipmi://192.168.122.1:6233",
+						CredentialsName: defaultSecretName,
+					},
+					ConsumerRef: &corev1.ObjectReference{
+						Kind:       "HostClaim",
+						APIVersion: "metal3.io/v1alpha1",
+						Namespace:  "hc-ns",
+						Name:       "hc",
+					},
+				}),
+			HostClaim: &metal3api.HostClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "hc",
+					Namespace: "hc-ns",
+				},
+				Spec: metal3api.HostClaimSpec{
+					UserData: &corev1.SecretReference{
+						Name: "user-data",
+					},
+				},
+				Status: metal3api.HostClaimStatus{
+					BareMetalHost: &metal3api.ObjectReference{
+						Namespace: namespace,
+						Name:      "host-user-data",
+					},
+				},
+			},
+			UserDataSecret:      newSecretInNamespace("user-data", "hc-ns", map[string]string{"userData": "somedata"}),
+			ExpectedUserData:    base64.StdEncoding.EncodeToString([]byte("somedata")),
+			ErrUserData:         false,
+			ExpectedNetworkData: "",
+			ErrNetworkData:      false,
+		},
+		{
+			Scenario: "host with network data only through hostclaim",
+			Host: newHost("host-user-data",
+				&metal3api.BareMetalHostSpec{
+					BMC: metal3api.BMCDetails{
+						Address:         "ipmi://192.168.122.1:6233",
+						CredentialsName: defaultSecretName,
+					},
+					ConsumerRef: &corev1.ObjectReference{
+						Kind:       "HostClaim",
+						APIVersion: "metal3.io/v1alpha1",
+						Namespace:  "hc-ns",
+						Name:       "hc",
+					},
+				}),
+			HostClaim: &metal3api.HostClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "hc",
+					Namespace: "hc-ns",
+				},
+				Spec: metal3api.HostClaimSpec{
+					NetworkData: &corev1.SecretReference{
+						Name: "net-data",
+					},
+				},
+				Status: metal3api.HostClaimStatus{
+					BareMetalHost: &metal3api.ObjectReference{
+						Namespace: namespace,
+						Name:      "host-user-data",
+					},
+				},
+			},
+			NetworkDataSecret:   newSecretInNamespace("net-data", "hc-ns", map[string]string{"networkData": "key: value"}),
+			ExpectedUserData:    "",
+			ErrUserData:         false,
+			ExpectedNetworkData: base64.StdEncoding.EncodeToString([]byte("key: value")),
+			ErrNetworkData:      false,
+		},
+		{
+			Scenario: "host with metadata only through hostclaim",
+			Host: newHost("host-meta-data",
+				&metal3api.BareMetalHostSpec{
+					BMC: metal3api.BMCDetails{
+						Address:         "ipmi://192.168.122.1:6233",
+						CredentialsName: defaultSecretName,
+					},
+					ConsumerRef: &corev1.ObjectReference{
+						Kind:       "HostClaim",
+						APIVersion: "metal3.io/v1alpha1",
+						Namespace:  "hc-ns",
+						Name:       "hc",
+					},
+				}),
+			HostClaim: &metal3api.HostClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "hc",
+					Namespace: "hc-ns",
+				},
+				Spec: metal3api.HostClaimSpec{
+					MetaData: &corev1.SecretReference{
+						Name: "meta-data",
+					},
+				},
+				Status: metal3api.HostClaimStatus{
+					BareMetalHost: &metal3api.ObjectReference{
+						Namespace: namespace,
+						Name:      "host-meta-data",
+					},
+				},
+			},
+			MetaDataSecret:   newSecretInNamespace("meta-data", "hc-ns", map[string]string{"metaData": "key: value"}),
+			ExpectedMetaData: base64.StdEncoding.EncodeToString([]byte("key: value")),
+			ErrMetaData:      false,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -482,15 +596,20 @@ func TestProvisionWithHostConfig(t *testing.T) {
 			tc.Host.Spec.Online = true
 
 			c := fakeclient.NewClientBuilder().WithObjects(tc.Host).Build()
+			if tc.HostClaim != nil {
+				_ = c.Create(t.Context(), tc.HostClaim)
+			}
 			_ = c.Create(t.Context(), testBMCSecret)
 			_ = c.Create(t.Context(), tc.UserDataSecret)
 			_ = c.Create(t.Context(), tc.NetworkDataSecret)
+			_ = c.Create(t.Context(), tc.MetaDataSecret)
 			_ = c.Create(t.Context(), tc.PreprovNetworkDataSecret)
 			baselog := ctrl.Log.WithName("controllers").WithName("BareMetalHost")
 			hcd := &hostConfigData{
 				host:          tc.Host,
 				log:           baselog.WithName("host_config_data"),
 				secretManager: secretutils.NewSecretManager(baselog, c, c),
+				hostClaim:     tc.HostClaim,
 			}
 
 			actualUserData, err := hcd.UserData(t.Context())
