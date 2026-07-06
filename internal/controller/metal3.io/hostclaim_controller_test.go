@@ -38,19 +38,26 @@ import (
 )
 
 type MockHostManager struct {
-	countSetFinalizer            int
-	countUnsetFinalizer          int
-	countSetConditionHostToFalse int
-	countSetConditionHostToTrue  int
-	countAssociate               int
-	countDelete                  int
-	countUpdate                  int
-	isProvisioned                bool
-	isAssociated                 bool
-	associateError               error
-	updateError                  error
-	deleteError                  error
-	conditions                   map[string]mockCondition
+	countSetFinalizer              int
+	countUnsetFinalizer            int
+	countSetConditionHostToFalse   int
+	countSetConditionHostToTrue    int
+	countSetPauseAnnotation        int
+	countRemovePauseAnnotation     int
+	countEnsureBlockMoveAnnotation int
+	countAssociate                 int
+	countDelete                    int
+	countUpdate                    int
+	isProvisioned                  bool
+	isAssociated                   bool
+	hasAnnotation                  bool
+	associateError                 error
+	updateError                    error
+	deleteError                    error
+	setPauseError                  error
+	ensureBlockMoveError           error
+	removePauseError               error
+	conditions                     map[string]mockCondition
 }
 
 type mockCondition struct {
@@ -87,6 +94,25 @@ func (m *MockHostManager) SetConditionHostToTrue(t string, reason string) {
 		m.conditions = map[string]mockCondition{}
 	}
 	m.conditions[t] = mockCondition{reason: reason, ok: true}
+}
+
+func (m *MockHostManager) SetPauseAnnotation(ctx context.Context) error {
+	m.countSetPauseAnnotation++
+	return m.setPauseError
+}
+
+func (m *MockHostManager) RemovePauseAnnotation(ctx context.Context) error {
+	m.countRemovePauseAnnotation++
+	return m.removePauseError
+}
+
+func (m *MockHostManager) EnsureBlockMoveAnnotation(ctx context.Context) error {
+	m.countEnsureBlockMoveAnnotation++
+	return m.ensureBlockMoveError
+}
+
+func (m *MockHostManager) HasAnnotation(_ string) bool {
+	return m.hasAnnotation
 }
 
 // setupSchemes configures schemes.
@@ -131,6 +157,7 @@ type testCaseHostClaimReconcile struct {
 	DeleteCalled         bool
 	SetFinalizerCalled   bool
 	UnsetFinalizerCalled bool
+	EarlyQuit            bool
 	AssociateError       error
 	UpdateError          error
 	DeleteError          error
@@ -175,6 +202,15 @@ var _ = Describe("Test HostClaim Controller",
 						Expect(result.RequeueAfter).To(BeZero())
 					}
 				}
+				if !tc.EarlyQuit {
+					if tc.HostManager.hasAnnotation {
+						Expect(tc.HostManager.countSetPauseAnnotation).To(Equal(1))
+						Expect(tc.HostManager.countRemovePauseAnnotation).To(BeZero())
+					} else {
+						Expect(tc.HostManager.countRemovePauseAnnotation).To(Equal(1))
+						Expect(tc.HostManager.countSetPauseAnnotation).To(BeZero())
+					}
+				}
 				if tc.AssociateCalled {
 					Expect(tc.HostManager.countAssociate).To(Equal(1))
 				} else {
@@ -205,6 +241,7 @@ var _ = Describe("Test HostClaim Controller",
 			Entry("No HostClaim", testCaseHostClaimReconcile{
 				HostClaim:   NewHostclaim("Another").Build(),
 				HostManager: &MockHostManager{},
+				EarlyQuit:   true,
 			}),
 			Entry("Not associated", testCaseHostClaimReconcile{
 				HostClaim:          NewHostclaim(HostclaimName).Build(),
