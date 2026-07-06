@@ -966,6 +966,10 @@ type ProvisionStatus struct {
 
 	// Custom deploy procedure applied to the host.
 	CustomDeploy *CustomDeploy `json:"customDeploy,omitempty"`
+
+	// Last Cleaning mode used when a HostClaim consumer existed.
+	// +optional
+	OverriddenCleaningPerformed AutomatedCleaningMode `json:"overriddenCleaningPerformed,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

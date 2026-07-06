@@ -44,6 +44,25 @@ put any value on this annotation **other than `metal3.io/capm3` and
 `metal3.io/hostclaim`, but another value that you have provided**. Removing the
 annotation will enable the reconciliation again.
 
+## Automated cleaning
+
+`spec.automatedCleaningMode` on **BareMetalHost** controls how Ironic
+cleans the disks before a host returns to `available`:
+
+- `metadata` (default) — a quick metadata wipe.
+- `disabled` — no wipe. Previous data remains on disk.
+
+A **HostClaim** that binds the host can override this with its own
+`spec.automatedCleaningMode`.
+Once the HostClaim is released, the operator checks the host setting.
+If it is stronger than what was applied during the last deprovisioning
+an automatic clean is performed immediately. To be able to perform the
+check the last cleaning mode applied under a HostClaim is recorded in
+`status.provisioning.overriddenCleaningPerformed`.
+
+The infrastructure can guarantee that unbound `available` hosts are
+always as clean as their `automatedCleaningMode` setting asks for.
+
 ## HostFirmwareSettings
 
 A **HostFirmwareSettings** resource is used to manage BIOS settings for a host,

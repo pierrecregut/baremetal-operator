@@ -1339,6 +1339,13 @@ spec:
                     required:
                     - url
                     type: object
+                  overriddenCleaningPerformed:
+                    description: Last Cleaning mode used when a HostClaim consumer
+                      existed.
+                    enum:
+                    - metadata
+                    - disabled
+                    type: string
                   raid:
                     description: The RAID configuration that has been applied.
                     properties:

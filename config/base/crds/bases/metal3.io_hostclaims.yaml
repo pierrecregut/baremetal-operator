@@ -39,6 +39,14 @@ spec:
           spec:
             description: HostClaimSpec defines the desired state of HostClaim.
             properties:
+              automatedCleaningMode:
+                description: |-
+                  When set to disabled, automated cleaning will be skipped
+                  during provisioning and deprovisioning.
+                enum:
+                - metadata
+                - disabled
+                type: string
               consumerRef:
                 description: |-
                   ConsumerRef can be used to store information about something

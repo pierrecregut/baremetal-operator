@@ -3853,3 +3853,113 @@ func TestGetHostClaimIfExists(t *testing.T) {
 		})
 	}
 }
+
+func TestRequiresCleaning(t *testing.T) {
+	testCases := []struct {
+		Scenario          string
+		BMHMode           metal3api.AutomatedCleaningMode
+		CleaningPerformed metal3api.AutomatedCleaningMode
+		HostClaimMode     metal3api.AutomatedCleaningMode
+		WithHostClaim     bool
+		ExpectedResult    bool
+	}{
+		{
+			Scenario:          "no hostclaim, no override recorded",
+			BMHMode:           metal3api.CleaningModeMetadata,
+			CleaningPerformed: "",
+			ExpectedResult:    false,
+		},
+		{
+			Scenario:          "hostclaim still present",
+			BMHMode:           metal3api.CleaningModeMetadata,
+			CleaningPerformed: metal3api.CleaningModeDisabled,
+			HostClaimMode:     metal3api.CleaningModeDisabled,
+			WithHostClaim:     true,
+			ExpectedResult:    false,
+		},
+		{
+			Scenario:          "hostclaim released; last=disabled, bmh=metadata",
+			BMHMode:           metal3api.CleaningModeMetadata,
+			CleaningPerformed: metal3api.CleaningModeDisabled,
+			ExpectedResult:    true,
+		},
+		{
+			Scenario:          "hostclaim released; last=metadata, bmh=metadata",
+			BMHMode:           metal3api.CleaningModeMetadata,
+			CleaningPerformed: metal3api.CleaningModeMetadata,
+			ExpectedResult:    false,
+		},
+		{
+			Scenario:          "hostclaim released; last=metadata, bmh=disabled",
+			BMHMode:           metal3api.CleaningModeDisabled,
+			CleaningPerformed: metal3api.CleaningModeMetadata,
+			ExpectedResult:    false,
+		},
+		{
+			Scenario:          "hostclaim released; last=disabled, bmh default (empty)",
+			BMHMode:           "",
+			CleaningPerformed: metal3api.CleaningModeDisabled,
+			ExpectedResult:    false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Scenario, func(t *testing.T) {
+			host := newDefaultHost(t)
+			host.Spec.AutomatedCleaningMode = tc.BMHMode
+			host.Status.Provisioning.OverriddenCleaningPerformed = tc.CleaningPerformed
+			info := makeReconcileInfo(host)
+			if tc.WithHostClaim {
+				info.hostclaim = &metal3api.HostClaim{
+					Spec: metal3api.HostClaimSpec{AutomatedCleaningMode: tc.HostClaimMode},
+				}
+			}
+			assert.Equal(t, tc.ExpectedResult, info.requiresCleaning())
+		})
+	}
+}
+
+func TestCurrentCleaningMode(t *testing.T) {
+	testCases := []struct {
+		Scenario      string
+		BMHMode       metal3api.AutomatedCleaningMode
+		HostClaimMode metal3api.AutomatedCleaningMode
+		WithHostClaim bool
+		Expected      metal3api.AutomatedCleaningMode
+	}{
+		{
+			Scenario: "no hostclaim: BMH spec wins",
+			BMHMode:  metal3api.CleaningModeMetadata,
+			Expected: metal3api.CleaningModeMetadata,
+		},
+		{
+			Scenario:      "hostclaim overrides",
+			BMHMode:       metal3api.CleaningModeMetadata,
+			HostClaimMode: metal3api.CleaningModeDisabled,
+			WithHostClaim: true,
+			Expected:      metal3api.CleaningModeDisabled,
+		},
+		{
+			// Empty HostClaim mode means "no opinion"; fall back to the BMH spec.
+			Scenario:      "hostclaim with empty mode: BMH spec wins",
+			BMHMode:       metal3api.CleaningModeMetadata,
+			HostClaimMode: "",
+			WithHostClaim: true,
+			Expected:      metal3api.CleaningModeMetadata,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Scenario, func(t *testing.T) {
+			host := newDefaultHost(t)
+			host.Spec.AutomatedCleaningMode = tc.BMHMode
+			info := makeReconcileInfo(host)
+			if tc.WithHostClaim {
+				info.hostclaim = &metal3api.HostClaim{
+					Spec: metal3api.HostClaimSpec{AutomatedCleaningMode: tc.HostClaimMode},
+				}
+			}
+			assert.Equal(t, tc.Expected, info.currentCleaningMode())
+		})
+	}
+}

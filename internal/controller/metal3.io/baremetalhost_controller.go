@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"runtime"
 	"slices"
@@ -934,7 +935,8 @@ func (r *BareMetalHostReconciler) registerHost(ctx context.Context, prov provisi
 		}
 	case metal3api.StateDeprovisioning:
 		// PreprovisioningImage is not required for deprovisioning when cleaning is disabled
-		if info.host.Spec.AutomatedCleaningMode == metal3api.CleaningModeDisabled {
+		// or handled manually (override)
+		if info.currentCleaningMode() == metal3api.CleaningModeDisabled {
 			preprovImgFormats = nil
 		}
 	case metal3api.StateInspecting:
@@ -977,7 +979,7 @@ func (r *BareMetalHostReconciler) registerHost(ctx context.Context, prov provisi
 		ctx,
 		provisioner.ManagementAccessData{
 			BootMode:                   info.host.Status.Provisioning.BootMode,
-			AutomatedCleaningMode:      info.host.Spec.AutomatedCleaningMode,
+			AutomatedCleaningMode:      info.currentCleaningMode(),
 			State:                      info.host.Status.Provisioning.State,
 			OperationalStatus:          info.host.Status.OperationalStatus,
 			CurrentImage:               getCurrentImage(info.host),
@@ -1335,6 +1337,33 @@ func getUpdatesDifference(specUpdates []metal3api.FirmwareUpdate, statusUpdates 
 
 func (r *BareMetalHostReconciler) actionPreparing(ctx context.Context, prov provisioner.Provisioner, info *reconcileInfo) actionResult {
 	info.log.V(VerbosityLevelTrace).Info("actionPreparing started")
+	// Setup cleaning
+	manualCleaning := info.requiresCleaning()
+	if manualCleaning {
+		r.Log.Info(
+			"re-running cleaning because the current mode is stricter than the last applied",
+			"currentMode", info.host.Spec.AutomatedCleaningMode,
+			"lastAppliedMode", info.host.Status.Provisioning.OverriddenCleaningPerformed)
+		prepareData := provisioner.PrepareData{
+			CleaningRequested: true,
+		}
+		provResult, _, err := prov.Prepare(ctx, prepareData, true,
+			info.host.Status.ErrorType == metal3api.PreparationError)
+
+		if err != nil {
+			return actionError{fmt.Errorf("error preparing host: %w", err)}
+		}
+
+		if provResult.ErrorMessage != "" {
+			return recordActionFailure(info, metal3api.PreparationError, provResult.ErrorMessage)
+		}
+
+		if provResult.Dirty {
+			return actionUpdate{actionContinue{provResult.RequeueAfter}}
+		}
+		info.host.Status.Provisioning.OverriddenCleaningPerformed = ""
+		return actionComplete{}
+	}
 
 	bmhDirty, newStatus, err := getHostProvisioningSettings(info.host, info)
 	if err != nil {
@@ -1519,6 +1548,8 @@ func (r *BareMetalHostReconciler) actionProvisioning(ctx context.Context, prov p
 		info.host.Status.Provisioning.CustomDeploy = info.host.Spec.CustomDeploy.DeepCopy()
 	}
 
+	// New OS provisioned. Forget the previous cleaning status if there was one.
+	info.host.Status.Provisioning.OverriddenCleaningPerformed = ""
 	// After provisioning we always requeue to ensure we enter the
 	// "provisioned" state and start monitoring power status.
 	return actionComplete{}
@@ -1565,7 +1596,7 @@ func (r *BareMetalHostReconciler) actionDeprovisioning(ctx context.Context, prov
 	provResult, err := prov.Deprovision(
 		ctx,
 		info.host.Status.ErrorType == metal3api.ProvisioningError,
-		info.host.Spec.AutomatedCleaningMode)
+		info.currentCleaningMode())
 	if err != nil {
 		return actionError{fmt.Errorf("failed to deprovision: %w", err)}
 	}
@@ -1593,6 +1624,9 @@ func (r *BareMetalHostReconciler) actionDeprovisioning(ctx context.Context, prov
 	// so we transition to the next state.
 	info.host.Status.Provisioning.Image = metal3api.Image{}
 	info.host.Status.Provisioning.CustomDeploy = nil
+	if info.hostclaim != nil && info.hostclaim.Spec.AutomatedCleaningMode != "" {
+		info.host.Status.Provisioning.OverriddenCleaningPerformed = info.currentCleaningMode()
+	}
 	clearHostProvisioningSettings(info.host)
 
 	return actionComplete{}
@@ -1810,7 +1844,7 @@ func (r *BareMetalHostReconciler) manageHostPower(ctx context.Context, prov prov
 		if info.host.Status.ErrorCount > 0 {
 			desiredRebootMode = metal3api.RebootModeHard
 		}
-		provResult, err = prov.PowerOff(ctx, desiredRebootMode, info.host.Status.ErrorType == metal3api.PowerManagementError, info.host.Spec.AutomatedCleaningMode)
+		provResult, err = prov.PowerOff(ctx, desiredRebootMode, info.host.Status.ErrorType == metal3api.PowerManagementError, info.currentCleaningMode())
 	}
 	if err != nil {
 		return actionError{fmt.Errorf("failed to change power state: %w", err)}
@@ -2085,6 +2119,10 @@ func (r *BareMetalHostReconciler) actionManageSteadyState(ctx context.Context, p
 // having been provisioned. Then we monitor its power status.
 func (r *BareMetalHostReconciler) actionManageAvailable(ctx context.Context, prov provisioner.Provisioner, info *reconcileInfo) actionResult {
 	info.log.V(VerbosityLevelTrace).Info("actionManageAvailable started")
+	// Cleanup status
+	if info.hostclaim == nil && info.host.Status.Provisioning.OverriddenCleaningPerformed != "" {
+		info.host.Status.Provisioning.OverriddenCleaningPerformed = ""
+	}
 	if info.host.NeedsProvisioning() {
 		if !reflect.DeepEqual(info.host.Spec.Image, info.host.Status.LastAttemptedImage) {
 			if info.host.Status.ProvisioningFailCount > 0 {
@@ -2888,4 +2926,36 @@ func (r *BareMetalHostReconciler) getHostClaimIfExists(ctx context.Context, host
 		return nil, nil //nolint:nilnil
 	}
 	return hostclaim, nil
+}
+
+func (info *reconcileInfo) currentCleaningMode() metal3api.AutomatedCleaningMode {
+	cleaningMode := info.host.Spec.AutomatedCleaningMode
+	if info.hostclaim != nil && info.hostclaim.Spec.AutomatedCleaningMode != "" {
+		cleaningMode = info.hostclaim.Spec.AutomatedCleaningMode
+	}
+	return cleaningMode
+}
+
+func modeWeight(mode metal3api.AutomatedCleaningMode) int {
+	switch mode {
+	case "": // nothing recorded
+		return 0
+	case metal3api.CleaningModeDisabled:
+		return 0
+	case metal3api.CleaningModeMetadata:
+		return 1
+	default:
+		// should not occur
+		return math.MaxInt
+	}
+}
+
+// Check if manual cleaning is required.
+// Manual cleaning is only triggered when we leave override and the last cleaningStatus
+// is weaker than the current automatedCleaningMode.
+func (info *reconcileInfo) requiresCleaning() bool {
+	if info.hostclaim != nil || info.host.Status.Provisioning.OverriddenCleaningPerformed == "" {
+		return false
+	}
+	return modeWeight(info.host.Spec.AutomatedCleaningMode) > modeWeight(info.host.Status.Provisioning.OverriddenCleaningPerformed)
 }

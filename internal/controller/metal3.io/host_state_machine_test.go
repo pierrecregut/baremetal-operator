@@ -1445,6 +1445,16 @@ func (hb *hostBuilder) SetOperationalStatus(status metal3api.OperationalStatus) 
 	return hb
 }
 
+func (hb *hostBuilder) SetAutomatedCleaningMode(mode metal3api.AutomatedCleaningMode) *hostBuilder {
+	hb.Spec.AutomatedCleaningMode = mode
+	return hb
+}
+
+func (hb *hostBuilder) SetOverriddenCleaningPerformed(mode metal3api.AutomatedCleaningMode) *hostBuilder {
+	hb.Status.Provisioning.OverriddenCleaningPerformed = mode
+	return hb
+}
+
 func (hb *hostBuilder) DisableInspection() *hostBuilder {
 	if hb.Annotations == nil {
 		hb.Annotations = make(map[string]string, 1)
@@ -1684,6 +1694,123 @@ func TestHandleAvailableBlocksProvisioningWhenNIInvalid(t *testing.T) {
 	require.NotNil(t, cond)
 	assert.Equal(t, metav1.ConditionFalse, cond.Status)
 	assert.Equal(t, "AttachmentNotFound", cond.Reason)
+}
+
+// TestHandleAvailableTriggersOverrideCleaning verifies the Available ->
+// Preparing transition when the current BMH cleaning mode is stronger than
+// what was last applied under a (now-gone) HostClaim.
+func TestHandleAvailableTriggersOverrideCleaning(t *testing.T) {
+	theHost := host(metal3api.StateAvailable).
+		SaveHostProvisioningSettings().
+		SetStatusImageURL("not-empty").
+		SetAutomatedCleaningMode(metal3api.CleaningModeMetadata).
+		SetOverriddenCleaningPerformed(metal3api.CleaningModeDisabled).
+		build()
+
+	prov := newMockProvisioner()
+	reconciler := testNewReconciler(theHost)
+	hsm := newHostStateMachine(theHost, reconciler, prov, true)
+	info := makeDefaultReconcileInfo(theHost)
+
+	hsm.ReconcileState(t.Context(), info)
+
+	assert.Equal(t, metal3api.StatePreparing, hsm.NextState,
+		"Available host with stronger cleaning spec than last applied must go to Preparing")
+	assert.False(t, prov.calledNoError("Prepare"),
+		"Prepare must not be called while still in Available")
+}
+
+// TestHandleAvailableDoesNotTriggerCleaningWhileHostClaimBound verifies the
+// requiresCleaning() short-circuit: as long as a HostClaim is still bound, we
+// do not re-clean even if the modes differ.
+func TestHandleAvailableDoesNotTriggerCleaningWhileHostClaimBound(t *testing.T) {
+	theHost := host(metal3api.StateAvailable).
+		SaveHostProvisioningSettings().
+		SetStatusImageURL("not-empty").
+		SetAutomatedCleaningMode(metal3api.CleaningModeMetadata).
+		SetOverriddenCleaningPerformed(metal3api.CleaningModeDisabled).
+		build()
+
+	prov := newMockProvisioner()
+	reconciler := testNewReconciler(theHost)
+	hsm := newHostStateMachine(theHost, reconciler, prov, true)
+	info := makeDefaultReconcileInfo(theHost)
+	// hardwire the hostclaim into info rather than deriving it from theHost.
+	info.hostclaim = &metal3api.HostClaim{
+		Spec: metal3api.HostClaimSpec{AutomatedCleaningMode: metal3api.CleaningModeDisabled},
+	}
+
+	hsm.ReconcileState(t.Context(), info)
+
+	assert.Equal(t, metal3api.StateAvailable, hsm.NextState,
+		"Available host must stay in Available while a HostClaim is still bound")
+}
+
+// TestActionPreparingOverrideCleaningBranch covers the three outcomes of a
+// Prepare call made from the cleaning branch of actionPreparing.
+func TestActionPreparingOverrideCleaningBranch(t *testing.T) {
+	testCases := []struct {
+		Scenario              string
+		PrepareResult         provisioner.Result
+		ExpectedState         metal3api.ProvisioningState
+		ExpectedErrorType     metal3api.ErrorType
+		ExpectedErrorMessage  string
+		ExpectedOverrideAfter metal3api.AutomatedCleaningMode
+	}{
+		{
+			// Ironic is still cleaning: stay in Preparing, do not clear the
+			// override marker. actionUpdate{actionContinue{...}} does NOT
+			// trigger a state transition in handlePreparing.
+			Scenario:              "cleaning in flight: stay in Preparing, keep marker",
+			PrepareResult:         provisioner.Result{Dirty: true, RequeueAfter: 5 * time.Second},
+			ExpectedState:         metal3api.StatePreparing,
+			ExpectedOverrideAfter: metal3api.CleaningModeDisabled, // unchanged
+		},
+		{
+			// Clean completed on Ironic side: advance to Available AND clear
+			// the override marker so requiresCleaning returns false next tick.
+			Scenario:              "cleaning complete: Available + marker cleared",
+			PrepareResult:         provisioner.Result{Dirty: false},
+			ExpectedState:         metal3api.StateAvailable,
+			ExpectedOverrideAfter: "",
+		},
+		{
+			// Prepare reports a terminal clean failure: PreparationError
+			// is recorded and the host stays in Preparing for backoff.
+			Scenario:              "cleaning failed: PreparationError recorded",
+			PrepareResult:         provisioner.Result{ErrorMessage: "clean failed"},
+			ExpectedState:         metal3api.StatePreparing,
+			ExpectedErrorType:     metal3api.PreparationError,
+			ExpectedErrorMessage:  "clean failed",
+			ExpectedOverrideAfter: metal3api.CleaningModeDisabled, // unchanged
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Scenario, func(t *testing.T) {
+			theHost := host(metal3api.StatePreparing).
+				SaveHostProvisioningSettings().
+				SetStatusImageURL("not-empty").
+				SetAutomatedCleaningMode(metal3api.CleaningModeMetadata).
+				SetOverriddenCleaningPerformed(metal3api.CleaningModeDisabled).
+				build()
+
+			prov := newMockProvisioner()
+			prov.nextResults["Prepare"] = tc.PrepareResult
+			reconciler := testNewReconciler(theHost)
+			hsm := newHostStateMachine(theHost, reconciler, prov, true)
+			info := makeDefaultReconcileInfo(theHost)
+
+			hsm.ReconcileState(t.Context(), info)
+
+			assert.Equal(t, tc.ExpectedState, hsm.NextState)
+			assert.Equal(t, tc.ExpectedErrorType, theHost.Status.ErrorType)
+			assert.Equal(t, tc.ExpectedErrorMessage, theHost.Status.ErrorMessage)
+			assert.Equal(t, tc.ExpectedOverrideAfter,
+				theHost.Status.Provisioning.OverriddenCleaningPerformed,
+				"OverriddenCleaningPerformed must be cleared only on completion")
+		})
+	}
 }
 
 func TestUpdateBootModeStatus(t *testing.T) {

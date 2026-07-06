@@ -70,6 +70,9 @@ When preparation completes, the host becomes `available`.
 A host already in `available` returns to `preparing` when RAID, firmware
 settings, or firmware component updates change.
 
+A host also returns to `preparing` to catch up on an override cleaning
+mode. See [Automated cleaning](api.md#automated-cleaning).
+
 ### Available
 
 A host in `available` can be provisioned.
@@ -81,6 +84,11 @@ The host moves to `provisioning` when `NeedsProvisioning()` is true:
 `spec.customDeploy` is set.
 Setting `spec.externallyProvisioned: true` moves an available host to
 `externally provisioned`.
+
+An available host returns to `preparing` when its RAID, firmware
+settings, or firmware component spec changes, or when its
+`automatedCleaningMode` is stronger than the mode last applied under a
+now-released HostClaim.
 
 ### Provisioning
 

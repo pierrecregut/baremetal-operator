@@ -126,6 +126,12 @@ type HostClaimSpec struct {
 	// infrastructure.cluster.x-k8s.io/failure-domain set to the value of
 	// the field.
 	FailureDomain string `json:"failureDomain,omitempty"`
+
+	// When set to disabled, automated cleaning will be skipped
+	// during provisioning and deprovisioning.
+	// +optional
+	// +kubebuilder:validation:Optional
+	AutomatedCleaningMode AutomatedCleaningMode `json:"automatedCleaningMode,omitempty"`
 }
 
 // HostSelector specifies matching criteria for labels on BareMetalHosts.
