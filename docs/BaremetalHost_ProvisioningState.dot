@@ -32,7 +32,7 @@ digraph BaremetalHost {
     Preparing -> PoweringOffBeforeDelete [label="deleted"]
 
     Available -> Provisioning [label="NeedsProvisioning()"]
-    Available -> Preparing [label="RAID / firmware\nsettings changed"]
+    Available -> Preparing [label="RAID / firmware\nsettings changed, or\nhostclaim cleaning catch-up"]
     Available -> Inspecting [label="inspect annotation"]
     Available -> ExternallyProvisioned [label="externallyProvisioned"]
     Available -> PoweringOffBeforeDelete [label="deleted"]

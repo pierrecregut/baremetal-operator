@@ -45,10 +45,12 @@ func TestPrepare(t *testing.T) {
 		ironic               *testserver.IronicMock
 		unprepared           bool
 		existRaidConfig      bool
+		cleaningRequested    bool
 		expectedStarted      bool
 		expectedDirty        bool
 		expectedError        bool
 		expectedRequestAfter int
+		expectedTarget       nodes.TargetProvisionState
 	}{
 		{
 			name: "manageable state(haven't clean steps)",
@@ -162,6 +164,32 @@ func TestPrepare(t *testing.T) {
 			expectedRequestAfter: 0,
 			expectedDirty:        false,
 		},
+		{
+			name: "available state(CleaningRequested) -> manage",
+			ironic: testserver.NewIronic(t).WithDefaultResponses().Node(nodes.Node{
+				ProvisionState: string(nodes.Available),
+				UUID:           nodeUUID,
+			}),
+			unprepared:           true,
+			cleaningRequested:    true,
+			expectedStarted:      false,
+			expectedDirty:        true,
+			expectedRequestAfter: 3,
+			expectedTarget:       nodes.TargetManage,
+		},
+		{
+			name: "manageable state(CleaningRequested) -> provide (automatic clean)",
+			ironic: testserver.NewIronic(t).WithDefaultResponses().Node(nodes.Node{
+				ProvisionState: string(nodes.Manageable),
+				UUID:           nodeUUID,
+			}),
+			unprepared:           true,
+			cleaningRequested:    true,
+			expectedStarted:      true,
+			expectedDirty:        true,
+			expectedRequestAfter: 3,
+			expectedTarget:       nodes.TargetProvide,
+		},
 	}
 
 	for _, tc := range cases {
@@ -173,7 +201,9 @@ func TestPrepare(t *testing.T) {
 
 			host := makeHost()
 			host.Status.Provisioning.ID = nodeUUID
-			prepData := provisioner.PrepareData{}
+			prepData := provisioner.PrepareData{
+				CleaningRequested: tc.cleaningRequested,
+			}
 			if tc.existRaidConfig {
 				host.Spec.BMC.Address = "raid-test://test.bmc/"
 				prepData.TargetRAIDConfig = &metal3api.RAIDConfig{
@@ -206,6 +236,11 @@ func TestPrepare(t *testing.T) {
 				require.NoError(t, err)
 			} else {
 				require.Error(t, err)
+			}
+			if tc.expectedTarget != "" {
+				update := tc.ironic.GetLastNodeStatesProvisionUpdateRequestFor(nodeUUID)
+				assert.Equal(t, tc.expectedTarget, update.Target,
+					"provision-state PUT must target %q", tc.expectedTarget)
 			}
 		})
 	}
