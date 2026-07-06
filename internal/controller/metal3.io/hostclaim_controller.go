@@ -76,6 +76,37 @@ func (r *HostClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Create a helper for managing the baremetal container hosting the machine.
 	hostClaimMgr := r.NewHostClaimManager(r.Client, log, hostClaim, r.APIReader)
 
+	// Ensure block-move annotation is always present on associated BMH.
+	if err = hostClaimMgr.EnsureBlockMoveAnnotation(ctx); err != nil {
+		log.Info("failed to ensure block-move annotation on associated BMH",
+			LogFieldError, err.Error())
+		return ctrl.Result{}, err
+	}
+
+	if hostClaimMgr.HasAnnotation(metal3api.PausedAnnotation) {
+		// set pause annotation on associated bmh (if any)
+		err = hostClaimMgr.SetPauseAnnotation(ctx)
+		if err != nil {
+			log.Info("failed to set pause annotation on associated bmh")
+			hostClaimMgr.SetConditionHostToFalse(
+				metal3api.AssociatedCondition, metal3api.PauseAnnotationSetFailedReason, err.Error())
+
+			return ctrl.Result{}, err
+		}
+		hostClaimMgr.SetConditionHostToFalse(
+			metal3api.AssociatedCondition, metal3api.HostPausedReason, "Host is paused")
+		// No reason to requeue. A change to pause annotation will trigger a reconcile.
+		return ctrl.Result{}, nil
+	}
+	err = hostClaimMgr.RemovePauseAnnotation(ctx)
+	if err != nil {
+		log.Info("failed to check pause annotation on associated bmh")
+		hostClaimMgr.SetConditionHostToFalse(
+			metal3api.AssociatedCondition, metal3api.PauseAnnotationRemoveFailedReason,
+			"Removal of pause annotation failed: "+err.Error())
+		return ctrl.Result{}, err
+	}
+
 	// Handle deleted machines
 	if !hostClaim.ObjectMeta.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, hostClaimMgr)

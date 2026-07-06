@@ -18,6 +18,7 @@ package hostclaim
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
 	"testing"
@@ -53,14 +54,14 @@ func setupScheme() *runtime.Scheme {
 }
 
 var _ = Describe("HostClaim manager", func() {
-	var defaultConsumerRef = corev1.ObjectReference{
-		Name:       HostclaimName,
-		Namespace:  HostclaimNamespace,
-		Kind:       HostClaimKind,
-		APIVersion: metal3api.GroupVersion.String(),
-	}
 
 	var (
+		defaultConsumerRef = corev1.ObjectReference{
+			Name:       HostclaimName,
+			Namespace:  HostclaimNamespace,
+			Kind:       HostClaimKind,
+			APIVersion: metal3api.GroupVersion.String(),
+		}
 		defaultImage = metal3api.Image{URL: "url"}
 	)
 
@@ -96,6 +97,298 @@ var _ = Describe("HostClaim manager", func() {
 			"bmh-cons-other", "ns1", metal3api.StateAvailable).SetLabels(defaultBmhLabels).
 			SetConsumerRef(corev1.ObjectReference{Kind: HostClaimKind, Namespace: HostclaimNamespace,
 				APIVersion: metal3api.GroupVersion.String(), Name: "other"}).Build()
+	)
+
+	DescribeTable("Test Finalizers",
+		func(hc *metal3api.HostClaim) {
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).Build()
+			hostMgr := NewManager(fakeClient, GinkgoLogr, hc, fakeClient)
+			hostMgr.SetFinalizer()
+			Expect(hc.ObjectMeta.Finalizers).To(ContainElement(
+				metal3api.HostClaimFinalizer,
+			))
+
+			hostMgr.UnsetFinalizer()
+
+			Expect(hc.ObjectMeta.Finalizers).NotTo(ContainElement(
+				metal3api.HostClaimFinalizer,
+			))
+		},
+		Entry("No finalizers", NewHostclaim(HostclaimName).Build()),
+		Entry("Additional Finalizers",
+			NewHostclaim(HostclaimName).SetFinalizer([]string{"finz"}).Build(),
+		),
+	)
+
+	It("test IsProvisionned", func() {
+		hc1 := NewHostclaim(HostclaimName).Build()
+		hc2 := NewHostclaim(HostclaimName).SetCondition(metal3api.ProvisionedCondition, true, "reason").Build()
+		fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).Build()
+		hostMgr := NewManager(fakeClient, GinkgoLogr, hc1, fakeClient)
+		Expect(hostMgr.IsProvisioned()).To(BeFalse())
+		hostMgr = NewManager(fakeClient, GinkgoLogr, hc2, fakeClient)
+		Expect(hostMgr.IsProvisioned()).To(BeTrue())
+	})
+
+	type testCaseSetPauseAnnotation struct {
+		HostClaim             *metal3api.HostClaim
+		BareMetalHost         *metal3api.BareMetalHost
+		ExpectPausePresent    bool
+		ExpectStatusPresent   bool
+		ExpectBlockMoveAbsent bool
+		ExpectError           bool
+	}
+
+	DescribeTable("Test Set BMH Pause Annotation",
+		func(tc testCaseSetPauseAnnotation) {
+			objs := []client.Object{tc.HostClaim}
+			if tc.BareMetalHost != nil {
+				objs = append(objs, tc.BareMetalHost)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+
+			hostMgr := NewManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient)
+
+			err := hostMgr.SetPauseAnnotation(context.TODO())
+			if tc.ExpectError {
+				Expect(err).To(HaveOccurred())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+			if tc.BareMetalHost == nil {
+				return
+			}
+			savedHost := metal3api.BareMetalHost{}
+			err = fakeClient.Get(context.TODO(),
+				client.ObjectKey{
+					Name:      tc.BareMetalHost.Name,
+					Namespace: tc.BareMetalHost.Namespace,
+				},
+				&savedHost,
+			)
+			Expect(err).NotTo(HaveOccurred())
+			_, pausePresent := savedHost.Annotations[metal3api.PausedAnnotation]
+			if tc.ExpectPausePresent {
+				Expect(pausePresent).To(BeTrue())
+			} else {
+				Expect(pausePresent).To(BeFalse())
+			}
+			status, statusPresent := savedHost.Annotations[metal3api.StatusAnnotation]
+			if tc.ExpectStatusPresent {
+				Expect(statusPresent).To(BeTrue())
+				annotation, err := json.Marshal(&tc.BareMetalHost.Status)
+				Expect(err).ToNot(HaveOccurred())
+				// (Note) manager code marshals the inspection data stored in annotation,
+				// which causes alphabetically reordering of keys. Since we are marshaling
+				// only the annotation, the status value here doesn't match the marshaled
+				// annotation data, because it wasn't re-ordered by the JSON marshaller.
+				// That's why we are marshaling status data as well so that its fields are
+				// also alphabetically reordered to match the annotation keys style..
+				obj := map[string]any{}
+				err = json.Unmarshal(annotation, &obj)
+				Expect(err).ToNot(HaveOccurred())
+				annotation, _ = json.Marshal(obj)
+				Expect(status).To(Equal(string(annotation)))
+			} else {
+				Expect(statusPresent).To(BeFalse())
+			}
+			if tc.ExpectBlockMoveAbsent {
+				_, blockMovePresent := savedHost.Annotations[BlockMoveAnnotation]
+				Expect(blockMovePresent).To(BeFalse(), "block-move annotation should be removed after SetPauseAnnotation")
+			}
+
+		},
+		Entry("Set BMH Pause Annotation, with valid Paused annotations, already paused", testCaseSetPauseAnnotation{
+			BareMetalHost: NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).SetConsumerRef(defaultConsumerRef).
+				SetAnnotations(map[string]string{metal3api.PausedAnnotation: PausedAnnotationValue, BlockMoveAnnotation: ""}).Build(),
+			HostClaim:             NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectPausePresent:    true,
+			ExpectBlockMoveAbsent: true,
+			ExpectError:           false,
+		}),
+		Entry("Set BMH Pause Annotation, with valid Paused annotations, Empty Key, already paused", testCaseSetPauseAnnotation{
+			BareMetalHost: NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).SetConsumerRef(defaultConsumerRef).
+				SetAnnotations(map[string]string{metal3api.PausedAnnotation: "", BlockMoveAnnotation: ""}).Build(),
+			HostClaim:             NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectPausePresent:    true,
+			ExpectBlockMoveAbsent: true,
+			ExpectError:           false,
+		}),
+		Entry("Set BMH Pause Annotation, with no Paused annotations", testCaseSetPauseAnnotation{
+			BareMetalHost:       NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).SetConsumerRef(defaultConsumerRef).Build(),
+			HostClaim:           NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectPausePresent:  true,
+			ExpectStatusPresent: true,
+			ExpectError:         false,
+		}),
+		Entry("Set BMH Pause Annotation, no bmh", testCaseSetPauseAnnotation{
+			BareMetalHost: nil,
+			HostClaim:     NewHostclaim(HostclaimName).Build(),
+		}),
+	)
+
+	type testCaseRemovePauseAnnotation struct {
+		HostClaim     *metal3api.HostClaim
+		BareMetalHost *metal3api.BareMetalHost
+		ExpectPresent bool
+		ExpectError   bool
+	}
+
+	DescribeTable("Test Remove BMH Pause Annotation",
+		func(tc testCaseRemovePauseAnnotation) {
+			objs := []client.Object{tc.HostClaim}
+			if tc.BareMetalHost != nil {
+				objs = append(objs, tc.BareMetalHost)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+
+			hostMgr := NewManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient)
+
+			err := hostMgr.RemovePauseAnnotation(context.TODO())
+			if tc.ExpectError {
+				Expect(err).To(HaveOccurred())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+			if tc.BareMetalHost == nil {
+				return
+			}
+			savedHost := metal3api.BareMetalHost{}
+			err = fakeClient.Get(context.TODO(),
+				client.ObjectKey{
+					Name:      tc.BareMetalHost.Name,
+					Namespace: tc.BareMetalHost.Namespace,
+				},
+				&savedHost,
+			)
+			Expect(err).NotTo(HaveOccurred())
+			if tc.ExpectPresent {
+				Expect(savedHost.Annotations[metal3api.PausedAnnotation]).NotTo(BeNil())
+			} else {
+				Expect(savedHost.Annotations).To(BeNil())
+			}
+		},
+		Entry("Remove BMH Pause Annotation, with valid Paused annotations", testCaseRemovePauseAnnotation{
+			BareMetalHost: NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).SetConsumerRef(defaultConsumerRef).
+				SetAnnotations(map[string]string{metal3api.PausedAnnotation: PausedAnnotationValue}).Build(),
+			HostClaim:     NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectPresent: false,
+			ExpectError:   false,
+		}),
+		Entry("Do not Remove Annotation, with valid Paused annotations, Empty Key", testCaseRemovePauseAnnotation{
+			BareMetalHost: NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).SetConsumerRef(defaultConsumerRef).
+				SetAnnotations(map[string]string{metal3api.PausedAnnotation: ""}).Build(),
+			HostClaim:     NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectPresent: true,
+			ExpectError:   false,
+		}),
+		Entry("No Annotation, Should Not Error", testCaseRemovePauseAnnotation{
+			BareMetalHost: NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).SetConsumerRef(defaultConsumerRef).Build(),
+			HostClaim:     NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectPresent: false,
+			ExpectError:   false,
+		}),
+		Entry("No Bmh, Should Not Error", testCaseRemovePauseAnnotation{
+			BareMetalHost: nil,
+			HostClaim:     NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+		}),
+	)
+
+	type testCaseEnsureBlockMoveAnnotation struct {
+		HostClaim          *metal3api.HostClaim
+		BareMetalHost      *metal3api.BareMetalHost
+		ExpectBlockMoveSet bool
+		ExpectError        bool
+	}
+
+	DescribeTable("Test EnsureBlockMoveAnnotation",
+		func(tc testCaseEnsureBlockMoveAnnotation) {
+			objs := []client.Object{tc.HostClaim}
+			if tc.BareMetalHost != nil {
+				objs = append(objs, tc.BareMetalHost)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+
+			hostMgr := NewManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient)
+
+			err := hostMgr.EnsureBlockMoveAnnotation(context.TODO())
+			if tc.ExpectError {
+				Expect(err).To(HaveOccurred())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+			if tc.BareMetalHost == nil {
+				return
+			}
+			savedHost := metal3api.BareMetalHost{}
+			err = fakeClient.Get(context.TODO(),
+				client.ObjectKey{
+					Name:      tc.BareMetalHost.Name,
+					Namespace: tc.BareMetalHost.Namespace,
+				},
+				&savedHost,
+			)
+			Expect(err).NotTo(HaveOccurred())
+			if tc.ExpectBlockMoveSet {
+				Expect(savedHost.Annotations).To(HaveKey(BlockMoveAnnotation))
+			} else {
+				Expect(savedHost.Annotations).NotTo(HaveKey(BlockMoveAnnotation))
+			}
+		},
+		Entry("BMH with matching consumer ref, no annotations: block-move is set", testCaseEnsureBlockMoveAnnotation{
+			BareMetalHost:      NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).SetConsumerRef(defaultConsumerRef).Build(),
+			HostClaim:          NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectBlockMoveSet: true,
+		}),
+		Entry("BMH with matching consumer ref, block-move already present: no change", testCaseEnsureBlockMoveAnnotation{
+			BareMetalHost: NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).SetConsumerRef(defaultConsumerRef).
+				SetAnnotations(map[string]string{BlockMoveAnnotation: ""}).Build(),
+			HostClaim:          NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectBlockMoveSet: true,
+		}),
+		Entry("BMH already paused: block-move is NOT (re-)set", testCaseEnsureBlockMoveAnnotation{
+			BareMetalHost: NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).SetConsumerRef(defaultConsumerRef).
+				SetAnnotations(map[string]string{metal3api.PausedAnnotation: PausedAnnotationValue}).Build(),
+			HostClaim:          NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectBlockMoveSet: false,
+		}),
+		Entry("BMH with no consumer ref, block-move not set", testCaseEnsureBlockMoveAnnotation{
+			BareMetalHost:      NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).Build(),
+			HostClaim:          NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectBlockMoveSet: false,
+		}),
+		Entry("BMH consumer ref points to another claim, block-move not set", testCaseEnsureBlockMoveAnnotation{
+			BareMetalHost: NewBaremetalhost("bmh1", "ns1", metal3api.StateProvisioned).SetConsumerRef(
+				corev1.ObjectReference{
+					Name:       "other",
+					Namespace:  HostclaimNamespace,
+					Kind:       HostClaimKind,
+					APIVersion: metal3api.GroupVersion.String(),
+				}).Build(),
+			HostClaim:          NewHostclaim(HostclaimName).SetAssociatedBMH("ns1", "bmh1").Build(),
+			ExpectBlockMoveSet: false,
+		}),
+		Entry("HostClaim has no associated BMH ref", testCaseEnsureBlockMoveAnnotation{
+			BareMetalHost: nil,
+			HostClaim:     NewHostclaim(HostclaimName).Build(),
+		}),
+	)
+
+	type testHasAnnotation struct {
+		HostClaim *metal3api.HostClaim
+		Result    bool
+	}
+
+	DescribeTable("Test HasAnnotation",
+		func(tc testHasAnnotation) {
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).Build()
+			hostMgr := NewManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient)
+			result := hostMgr.HasAnnotation("annot")
+			Expect(result).To(Equal(tc.Result))
+		},
+		Entry("no annotation", testHasAnnotation{HostClaim: NewHostclaim(HostclaimName).Build(), Result: false}),
+		Entry("other annotation", testHasAnnotation{HostClaim: NewHostclaim(HostclaimName).SetAnnotations(map[string]string{"other": "v"}).Build(), Result: false}),
+		Entry("other annotation", testHasAnnotation{HostClaim: NewHostclaim(HostclaimName).SetAnnotations(map[string]string{"annot": "ns/bmh"}).Build(), Result: true}),
 	)
 
 	DescribeTable("Test chooseBMH",

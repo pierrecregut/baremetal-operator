@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"regexp"
 	"slices"
@@ -40,6 +41,7 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
@@ -72,6 +74,10 @@ const (
 	// RebootHostClaimOwnedPrefix is a prefix on the shortname of a reboot
 	// annotation on a BMH when it is owned by a HostClaim.
 	RebootHostClaimOwnedPrefix = "hostclaim-"
+	// BlockMoveAnnotation is the clusterctl annotation that prevents an object
+	// from being moved until it is removed. Used to synchronize pause/status
+	// annotation application with clusterctl pivot operations.
+	BlockMoveAnnotation = "clusterctl.cluster.x-k8s.io/block-move"
 
 	hostclaimRebootPrefix = metal3api.RebootAnnotationPrefix + "/"
 	bmhRebootPrefix       = hostclaimRebootPrefix + RebootHostClaimOwnedPrefix
@@ -94,6 +100,10 @@ type ManagerInterface interface {
 	Associate(context.Context) error
 	Delete(context.Context) error
 	Update(context.Context) error
+	SetPauseAnnotation(context.Context) error
+	RemovePauseAnnotation(context.Context) error
+	EnsureBlockMoveAnnotation(context.Context) error
+	HasAnnotation(string) bool
 }
 
 // NewManager returns a new helper for managing a hostclaim.
@@ -144,6 +154,193 @@ func (m *Manager) SetConditionHostToTrue(
 	reason string,
 ) {
 	conditions.Set(m.HostClaim, metav1.Condition{Type: t, Status: metav1.ConditionTrue, Reason: reason, Message: ""})
+}
+
+// SetPauseAnnotation propagates the pause annotation from the hostclaim to the BareMetalHost.
+func (m *Manager) SetPauseAnnotation(ctx context.Context) error {
+	// look for associated BMH
+	bmh, err := m.getBmh(ctx)
+	if err != nil && !errors.Is(err, ErrNoBMH) {
+		return err
+	}
+	if bmh == nil {
+		return nil
+	}
+
+	helper, err := patch.NewHelper(bmh, m.client)
+	if err != nil {
+		return err
+	}
+
+	annotations := bmh.GetAnnotations()
+
+	if annotations != nil {
+		if _, ok := annotations[metal3api.PausedAnnotation]; ok {
+			// BMH is already paused. Clean up block-move annotation if present.
+			if _, hasBlockMove := annotations[BlockMoveAnnotation]; hasBlockMove {
+				m.Log.Info("Removing stale block-move annotation from paused BMH",
+					LogFieldHost, bmh.Name,
+					LogFieldNamespace, bmh.Namespace)
+				delete(bmh.Annotations, BlockMoveAnnotation)
+				if patchErr := helper.Patch(ctx, bmh); patchErr != nil {
+					return fmt.Errorf("failed to remove stale block-move annotation: %w", patchErr)
+				}
+			}
+			m.Log.Info("BareMetalHost is already paused",
+				LogFieldHost, bmh.Name,
+				LogFieldNamespace, bmh.Namespace)
+			return nil
+		}
+	} else {
+		bmh.Annotations = make(map[string]string)
+	}
+
+	// Ensure block-move annotation is present to prevent clusterctl
+	// from moving the BMH before pause and status annotations are set.
+	if _, hasBlockMove := bmh.Annotations[BlockMoveAnnotation]; !hasBlockMove {
+		m.Log.Info("Setting block-move annotation on BareMetalHost",
+			LogFieldHost, bmh.Name,
+			LogFieldNamespace, bmh.Namespace)
+		bmh.Annotations[BlockMoveAnnotation] = ""
+		if patchErr := helper.Patch(ctx, bmh); patchErr != nil {
+			return fmt.Errorf("failed to set block-move annotation: %w", patchErr)
+		}
+		helper, err = patch.NewHelper(bmh, m.client)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Set pause and status annotations
+	m.Log.Info("Adding pause annotation to BareMetalHost",
+		LogFieldHost, bmh.Name,
+		LogFieldNamespace, bmh.Namespace)
+
+	bmh.Annotations[metal3api.PausedAnnotation] = PausedAnnotationValue
+
+	// Setting annotation with BMH status
+	newAnnotation, err := json.Marshal(&bmh.Status)
+	if err != nil {
+		return fmt.Errorf("failed to marshal status annotation: %w", err)
+	}
+	obj := map[string]any{}
+	if err = json.Unmarshal(newAnnotation, &obj); err != nil {
+		return fmt.Errorf("failed to unmarshal status annotation: %w", err)
+	}
+	delete(obj, "hardware")
+	newAnnotation, err = json.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal status annotation: %w", err)
+	}
+	bmh.Annotations[metal3api.StatusAnnotation] = string(newAnnotation)
+
+	if patchErr := helper.Patch(ctx, bmh); patchErr != nil {
+		return fmt.Errorf("failed to set pause annotations: %w", patchErr)
+	}
+
+	helper, err = patch.NewHelper(bmh, m.client)
+	if err != nil {
+		return err
+	}
+
+	if _, hasBlockMove := bmh.Annotations[BlockMoveAnnotation]; hasBlockMove {
+		m.Log.Info("Removing block-move annotation from BareMetalHost",
+			LogFieldHost, bmh.Name,
+			LogFieldNamespace, bmh.Namespace)
+		delete(bmh.Annotations, BlockMoveAnnotation)
+		if patchErr := helper.Patch(ctx, bmh); patchErr != nil {
+			return fmt.Errorf("failed to remove block-move annotation: %w", patchErr)
+		}
+	}
+
+	return nil
+}
+
+// RemovePauseAnnotation removes the pause annotation on the BareMetalHost.
+func (m *Manager) RemovePauseAnnotation(ctx context.Context) error {
+	// look for associated BMH
+	bmh, err := m.getBmh(ctx)
+	if err != nil && !errors.Is(err, ErrNoBMH) {
+		return fmt.Errorf("cannot access BareMetalHost: %w", err)
+	}
+	if bmh == nil {
+		return nil
+	}
+
+	helper, err := patch.NewHelper(bmh, m.client)
+	if err != nil {
+		return err
+	}
+
+	annotations := bmh.GetAnnotations()
+
+	if annotations == nil {
+		return nil
+	}
+
+	if _, ok := annotations[metal3api.PausedAnnotation]; ok {
+		if annotations[metal3api.PausedAnnotation] == PausedAnnotationValue {
+			// Removing BMH Paused Annotation Since Owner Cluster is not paused.
+			delete(bmh.Annotations, metal3api.PausedAnnotation)
+			return helper.Patch(ctx, bmh)
+		}
+		m.Log.Info("BareMetalHost is paused by user, not removing pause annotation",
+			LogFieldHost, bmh.Name,
+			LogFieldNamespace, bmh.Namespace)
+
+	}
+	return nil
+}
+
+// EnsureBlockMoveAnnotation ensures the block-move annotation is present on
+// the associated BareMetalHost to prevent clusterctl from moving it while the
+// BareMetalHost is not paused.
+// The annotation is NOT re-set if the BMH already has a pause annotation.
+func (m *Manager) EnsureBlockMoveAnnotation(ctx context.Context) error {
+	bmh, err := m.getBmh(ctx)
+	if err != nil && !errors.Is(err, ErrNoBMH) {
+		return err
+	}
+	if bmh == nil {
+		return nil
+	}
+
+	helper, err := patch.NewHelper(bmh, m.client)
+	if err != nil {
+		return err
+	}
+
+	annotations := bmh.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+
+	if _, exists := annotations[BlockMoveAnnotation]; exists {
+		return nil // Already present
+	}
+
+	// Don't re-set block-move if BMH is already paused — SetPauseAnnotation()
+	// already completed its lifecycle and intentionally removed block-move.
+	if _, paused := annotations[metal3api.PausedAnnotation]; paused {
+		return nil
+	}
+
+	m.Log.Info("Ensuring block-move annotation on BareMetalHost",
+		LogFieldHost, bmh.Name,
+		LogFieldNamespace, bmh.Namespace)
+	annotations[BlockMoveAnnotation] = ""
+	bmh.SetAnnotations(annotations)
+	return helper.Patch(ctx, bmh)
+}
+
+// HasAnnotation makes sure the host has an annotation that references a host.
+func (m *Manager) HasAnnotation(annotation string) bool {
+	annotations := m.HostClaim.ObjectMeta.GetAnnotations()
+	if annotations == nil {
+		return false
+	}
+	_, ok := annotations[annotation]
+	return ok
 }
 
 // Associate associates a BareMetalHost to the HostClaim. It chooses a BareMetalHost in a namespace that accepts
@@ -279,6 +476,10 @@ func (m *Manager) Delete(ctx context.Context) error {
 	}
 
 	if bmh.Annotations != nil {
+		// delete pause annotation if set by the hostClaim
+		if bmh.Annotations[metal3api.PausedAnnotation] == PausedAnnotationValue {
+			delete(bmh.Annotations, metal3api.PausedAnnotation)
+		}
 		// delete detach if they look associated to the claim not from the infra
 		if annotValue, ok := bmh.Annotations[metal3api.DetachedAnnotation]; ok {
 			args := metal3api.DetachedAnnotationArguments{}
