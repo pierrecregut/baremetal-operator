@@ -29,6 +29,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -325,6 +326,59 @@ var _ = Describe("Test HostClaim Controller",
 		It("Test BareMetalHostToHostClaims (no consumer ref)", func() {
 			reqList := BareMetalHostToHostClaims(context.TODO(), NewBaremetalhost(baremetalName, baremetalNamespace, metal3api.StateAvailable).Build())
 			Expect(reqList).To(BeEmpty())
+		})
+
+		It("Test HardwareDataToHostClaims enqueues claim from bound annotation (cross-namespace)", func() {
+			hd := &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: baremetalName, Namespace: baremetalNamespace,
+					Annotations: map[string]string{
+						hostclaim.HostClaimBoundAnnotation: HostclaimNamespace + "/" + HostclaimName,
+					},
+				},
+			}
+			scheme := setupScheme()
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+			r := &HostClaimReconciler{Client: fakeClient, Scheme: scheme, Log: GinkgoLogr, APIReader: fakeClient}
+			reqList := r.HardwareDataToHostClaims(context.TODO(), hd)
+			Expect(reqList).To(HaveLen(1))
+			Expect(reqList[0].Name).To(Equal(HostclaimName))
+			Expect(reqList[0].Namespace).To(Equal(HostclaimNamespace))
+		})
+
+		It("Test HardwareDataToHostClaims enqueues claim from bound annotation (same-namespace / pivot)", func() {
+			hd := &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: baremetalName, Namespace: HostclaimNamespace,
+					Annotations: map[string]string{
+						hostclaim.HostClaimBoundAnnotation: HostclaimNamespace + "/" + HostclaimName,
+					},
+				},
+			}
+			scheme := setupScheme()
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+			r := &HostClaimReconciler{Client: fakeClient, Scheme: scheme, Log: GinkgoLogr, APIReader: fakeClient}
+			reqList := r.HardwareDataToHostClaims(context.TODO(), hd)
+			Expect(reqList).To(HaveLen(1))
+			Expect(reqList[0].Name).To(Equal(HostclaimName))
+			Expect(reqList[0].Namespace).To(Equal(HostclaimNamespace))
+		})
+
+		It("Test HardwareDataToHostClaims ignores HD without bound annotation (e.g. the claim-namespace copy)", func() {
+			hd := &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{Name: HostclaimName, Namespace: HostclaimNamespace},
+			}
+			scheme := setupScheme()
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+			r := &HostClaimReconciler{Client: fakeClient, Scheme: scheme, Log: GinkgoLogr, APIReader: fakeClient}
+			Expect(r.HardwareDataToHostClaims(context.TODO(), hd)).To(BeEmpty())
+		})
+
+		It("Test HardwareDataToHostClaims returns nil for non-HardwareData object", func() {
+			scheme := setupScheme()
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+			r := &HostClaimReconciler{Client: fakeClient, Scheme: scheme, Log: GinkgoLogr, APIReader: fakeClient}
+			Expect(r.HardwareDataToHostClaims(context.TODO(), &metal3api.BareMetalHost{})).To(BeNil())
 		})
 	},
 )
