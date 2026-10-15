@@ -200,6 +200,10 @@ func (r *HostClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&metal3api.BareMetalHost{},
 			handler.EnqueueRequestsFromMapFunc(BareMetalHostToHostClaims),
 		).
+		Watches(
+			&metal3api.HardwareData{},
+			handler.EnqueueRequestsFromMapFunc(r.HardwareDataToHostClaims),
+		).
 		Complete(r)
 }
 
@@ -221,6 +225,27 @@ func BareMetalHostToHostClaims(_ context.Context, obj client.Object) []ctrl.Requ
 		}
 	}
 	return []ctrl.Request{}
+}
+
+// HardwareDataToHostClaims returns a reconcile request if the HardwareData was annotated by a HostClaim with the
+// HostClaimBoundAnnotation.
+func (r *HostClaimReconciler) HardwareDataToHostClaims(_ context.Context, obj client.Object) []ctrl.Request {
+	hd, ok := obj.(*metal3api.HardwareData)
+	if !ok {
+		return nil
+	}
+	bound, ok := hd.Annotations[hostclaimManager.HostClaimBoundAnnotation]
+	if !ok {
+		return nil
+	}
+
+	namespace, name, ok := strings.Cut(bound, "/")
+	if !ok {
+		return nil
+	}
+	return []ctrl.Request{
+		{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}},
+	}
 }
 
 func checkHostClaimError(err error, errMessage string) (ctrl.Result, error) {

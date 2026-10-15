@@ -28,11 +28,13 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -786,7 +788,7 @@ var _ = Describe("HostClaim manager", func() {
 		}),
 	)
 
-	It("Test updateHostClaimStatus",
+	It("Test updateHostClaimStatus (cross-namespace: points at claim-namespace copy)",
 		func() {
 			hostClaim := NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").Build()
 			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable).
@@ -800,10 +802,23 @@ var _ = Describe("HostClaim manager", func() {
 			hostMgr.updateHostClaimStatus(bmh)
 			Expect(hostClaim.Status.PoweredOn).To(BeTrue())
 			Expect(hostClaim.Status.HardwareData).NotTo(BeNil())
-			Expect(hostClaim.Status.HardwareData.Name).To(Equal("bmh"))
-			Expect(hostClaim.Status.HardwareData.Namespace).To(Equal("ns"))
+			Expect(hostClaim.Status.HardwareData.Name).To(Equal(hostClaim.Name))
+			Expect(hostClaim.Status.HardwareData.Namespace).To(Equal(hostClaim.Namespace))
 			Expect(conditions.IsFalse(hostClaim, metal3api.ProvisionedCondition)).To(BeTrue())
 			Expect(conditions.IsTrue(hostClaim, metal3api.AvailableForProvisioningCondition)).To(BeTrue())
+		})
+
+	It("Test updateHostClaimStatus (same-namespace: points at source BMH-named HD)",
+		func() {
+			hostClaim := NewHostclaim(HostclaimName).SetAssociatedBMH(HostclaimNamespace, "bmh").Build()
+			bmh := NewBaremetalhost("bmh", HostclaimNamespace, metal3api.StateAvailable).Build()
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).Build()
+			hostMgr, ok := NewManager(fakeClient, GinkgoLogr, hostClaim, fakeClient).(*Manager)
+			Expect(ok).To(BeTrue())
+			hostMgr.updateHostClaimStatus(bmh)
+			Expect(hostClaim.Status.HardwareData).NotTo(BeNil())
+			Expect(hostClaim.Status.HardwareData.Name).To(Equal(bmh.Name))
+			Expect(hostClaim.Status.HardwareData.Namespace).To(Equal(bmh.Namespace))
 		})
 
 	It("test syncReboot",
@@ -967,8 +982,8 @@ var _ = Describe("HostClaim manager", func() {
 			Expect(hc.Status.PoweredOn).To(Equal(tc.ExpectHostClaimPowerOn))
 			if tc.ExpectHardwareData {
 				Expect(hc.Status.HardwareData).NotTo(BeNil())
-				Expect(hc.Status.HardwareData.Name).To(Equal(bmh.Name))
-				Expect(hc.Status.HardwareData.Namespace).To(Equal(bmh.Namespace))
+				Expect(hc.Status.HardwareData.Name).To(Equal(hc.Name))
+				Expect(hc.Status.HardwareData.Namespace).To(Equal(hc.Namespace))
 				Expect(hc.Status.LastUpdated).NotTo(BeNil())
 			}
 			assoc := conditions.Get(hc, metal3api.AssociatedCondition)
@@ -1157,6 +1172,456 @@ var _ = Describe("HostClaim manager", func() {
 					APIVersion: metal3api.GroupVersion.String(),
 				}).Build(),
 			ExpectBmhGone: true,
+		}),
+	)
+
+	DescribeTable("Test filterMetadata",
+		func(in, want map[string]string) {
+			Expect(filterMetadata(in)).To(Equal(want))
+		},
+		Entry("nil input returns nil", nil, map[string]string(nil)),
+		Entry("empty input returns empty",
+			map[string]string{},
+			map[string]string{},
+		),
+		Entry("filters metal3.io",
+			map[string]string{"metal3.io/foo": "v", "keep": "v"},
+			map[string]string{"keep": "v"},
+		),
+		Entry("filters kubernetes.io and *.kubernetes.io",
+			map[string]string{
+				"kubernetes.io/arch":      "amd64",
+				"node.kubernetes.io/zone": "a",
+				"example.com/foo":         "bar",
+			},
+			map[string]string{"example.com/foo": "bar"},
+		),
+		Entry("keeps bare keys and multi-slash keys",
+			map[string]string{
+				"single":        "v",
+				"a/b/c":         "v",
+				"metal3.io/foo": "drop",
+			},
+			map[string]string{"single": "v", "a/b/c": "v"},
+		),
+	)
+
+	type testCaseSyncHardwareData struct {
+		HostClaim        *metal3api.HostClaim
+		SourceHardware   *metal3api.HardwareData // in BMH namespace; nil = not present
+		ExistingCopy     *metal3api.HardwareData // in HostClaim namespace; nil = not present
+		BMHLabels        map[string]string
+		BMHAnnotations   map[string]string
+		ExpectCopyExists bool
+		ExpectDetails    *metal3api.HardwareDetails
+		ExpectLabels     map[string]string
+		ExpectAnnots     map[string]string
+		ExpectError      bool
+	}
+
+	DescribeTable("Test syncHardwareData",
+		func(tc testCaseSyncHardwareData) {
+			ctx := context.TODO()
+			bmh := NewBaremetalhost("bmh", "ns", metal3api.StateProvisioned).SetConsumerRef(defaultConsumerRef).Build()
+			if tc.BMHLabels != nil {
+				bmh.Labels = tc.BMHLabels
+			}
+			if tc.BMHAnnotations != nil {
+				bmh.Annotations = tc.BMHAnnotations
+			}
+			objs := []client.Object{tc.HostClaim, bmh}
+			if tc.SourceHardware != nil {
+				objs = append(objs, tc.SourceHardware)
+			}
+			if tc.ExistingCopy != nil {
+				objs = append(objs, tc.ExistingCopy)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+			hostMgr, ok := NewManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient).(*Manager)
+			Expect(ok).To(BeTrue())
+			err := hostMgr.syncHardwareData(ctx, bmh)
+			if tc.ExpectError {
+				Expect(err).To(HaveOccurred())
+				return
+			}
+			Expect(err).NotTo(HaveOccurred())
+			hdCopy := &metal3api.HardwareData{}
+			getErr := fakeClient.Get(ctx, client.ObjectKey{
+				Name: tc.HostClaim.Name, Namespace: tc.HostClaim.Namespace,
+			}, hdCopy)
+			if !tc.ExpectCopyExists {
+				Expect(k8serrors.IsNotFound(getErr)).To(BeTrue(), "copy must not exist")
+				return
+			}
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(hdCopy.Spec.HardwareDetails).To(Equal(tc.ExpectDetails))
+			if tc.ExpectLabels == nil {
+				Expect(hdCopy.Labels).To(BeEmpty())
+			} else {
+				Expect(hdCopy.Labels).To(Equal(tc.ExpectLabels))
+			}
+			if tc.ExpectAnnots == nil {
+				Expect(hdCopy.Annotations).To(BeEmpty())
+			} else {
+				Expect(hdCopy.Annotations).To(Equal(tc.ExpectAnnots))
+			}
+			if tc.ExistingCopy == nil && tc.SourceHardware != nil {
+				// Fresh copy created by sync: owner ref must be set.
+				Expect(hdCopy.OwnerReferences).To(HaveLen(1))
+				Expect(hdCopy.OwnerReferences[0].Name).To(Equal(tc.HostClaim.Name))
+				Expect(hdCopy.OwnerReferences[0].Kind).To(Equal("HostClaim"))
+			}
+			if tc.SourceHardware != nil {
+				// Source HD must carry the bound annotation so HardwareData
+				// events can be routed back to this claim without a BMH lookup.
+				src := &metal3api.HardwareData{}
+				Expect(fakeClient.Get(ctx, client.ObjectKey{
+					Name: tc.SourceHardware.Name, Namespace: tc.SourceHardware.Namespace,
+				}, src)).To(Succeed())
+				Expect(src.Annotations).To(HaveKeyWithValue(
+					HostClaimBoundAnnotation,
+					tc.HostClaim.Namespace+"/"+tc.HostClaim.Name,
+				))
+				// The copy must NOT carry the bound annotation (filterMetadata drops it).
+				Expect(hdCopy.Annotations).NotTo(HaveKey(HostClaimBoundAnnotation))
+			}
+		},
+		Entry("Source missing, no copy: no-op", testCaseSyncHardwareData{
+			HostClaim:        NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").Build(),
+			ExpectCopyExists: false,
+		}),
+		Entry("Source missing, copy exists: copy preserved (inspection gap)", testCaseSyncHardwareData{
+			HostClaim: NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").Build(),
+			ExistingCopy: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{Name: HostclaimName, Namespace: HostclaimNamespace},
+				Spec:       metal3api.HardwareDataSpec{HardwareDetails: &metal3api.HardwareDetails{Hostname: "stale"}},
+			},
+			ExpectCopyExists: true,
+			ExpectDetails:    &metal3api.HardwareDetails{Hostname: "stale"},
+		}),
+		Entry("Create copy when source exists", testCaseSyncHardwareData{
+			HostClaim: NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").Build(),
+			SourceHardware: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{Name: "bmh", Namespace: "ns"},
+				Spec:       metal3api.HardwareDataSpec{HardwareDetails: &metal3api.HardwareDetails{Hostname: "host1"}},
+			},
+			BMHLabels:        map[string]string{"metal3.io/skip": "x", "keep": "v"},
+			BMHAnnotations:   map[string]string{"kubernetes.io/arch": "amd64", "note": "hi"},
+			ExpectCopyExists: true,
+			ExpectDetails:    &metal3api.HardwareDetails{Hostname: "host1"},
+			ExpectLabels:     map[string]string{"keep": "v"},
+			ExpectAnnots:     map[string]string{"note": "hi"},
+		}),
+		Entry("Update copy when source details change", testCaseSyncHardwareData{
+			HostClaim: NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").Build(),
+			SourceHardware: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{Name: "bmh", Namespace: "ns"},
+				Spec:       metal3api.HardwareDataSpec{HardwareDetails: &metal3api.HardwareDetails{Hostname: "new"}},
+			},
+			ExistingCopy: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{Name: HostclaimName, Namespace: HostclaimNamespace},
+				Spec:       metal3api.HardwareDataSpec{HardwareDetails: &metal3api.HardwareDetails{Hostname: "old"}},
+			},
+			ExpectCopyExists: true,
+			ExpectDetails:    &metal3api.HardwareDetails{Hostname: "new"},
+		}),
+		Entry("No-op when copy already matches", testCaseSyncHardwareData{
+			HostClaim: NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").Build(),
+			SourceHardware: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{Name: "bmh", Namespace: "ns"},
+				Spec:       metal3api.HardwareDataSpec{HardwareDetails: &metal3api.HardwareDetails{Hostname: "same"}},
+			},
+			BMHLabels: map[string]string{"keep": "v"},
+			ExistingCopy: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      HostclaimName,
+					Namespace: HostclaimNamespace,
+					Labels:    map[string]string{"keep": "v"},
+				},
+				Spec: metal3api.HardwareDataSpec{HardwareDetails: &metal3api.HardwareDetails{Hostname: "same"}},
+			},
+			ExpectCopyExists: true,
+			ExpectDetails:    &metal3api.HardwareDetails{Hostname: "same"},
+			ExpectLabels:     map[string]string{"keep": "v"},
+		}),
+	)
+
+	type testCaseSyncInPlace struct {
+		HostClaim         *metal3api.HostClaim
+		SourceHardware    *metal3api.HardwareData
+		BMHLabels         map[string]string
+		BMHAnnotations    map[string]string
+		OriginalDetails   *metal3api.HardwareDetails
+		OriginalOwnerRefs []metav1.OwnerReference
+		ExpectLabels      map[string]string
+		ExpectAnnots      map[string]string
+	}
+
+	DescribeTable("Test syncHardwareData (same-namespace / in-place)",
+		func(tc testCaseSyncInPlace) {
+			ctx := context.TODO()
+			// Same-namespace: BMH lives in HostclaimNamespace.
+			bmh := NewBaremetalhost("bmh", HostclaimNamespace, metal3api.StateProvisioned).
+				SetConsumerRef(defaultConsumerRef).Build()
+			if tc.BMHLabels != nil {
+				bmh.Labels = tc.BMHLabels
+			}
+			if tc.BMHAnnotations != nil {
+				bmh.Annotations = tc.BMHAnnotations
+			}
+			objs := []client.Object{tc.HostClaim, bmh}
+			if tc.SourceHardware != nil {
+				objs = append(objs, tc.SourceHardware)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+			hostMgr, ok := NewManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient).(*Manager)
+			Expect(ok).To(BeTrue())
+			Expect(hostMgr.syncHardwareData(ctx, bmh)).To(Succeed())
+
+			// No "copy" at (claimNs, claim.Name) must be created in the same-ns path.
+			dup := &metal3api.HardwareData{}
+			dupErr := fakeClient.Get(ctx, client.ObjectKey{
+				Name: tc.HostClaim.Name, Namespace: tc.HostClaim.Namespace,
+			}, dup)
+			Expect(k8serrors.IsNotFound(dupErr)).To(BeTrue(), "no copy must be created in same-namespace case")
+
+			if tc.SourceHardware == nil {
+				return
+			}
+			src := &metal3api.HardwareData{}
+			Expect(fakeClient.Get(ctx, client.ObjectKey{
+				Name: tc.SourceHardware.Name, Namespace: tc.SourceHardware.Namespace,
+			}, src)).To(Succeed())
+			if tc.ExpectLabels == nil {
+				Expect(src.Labels).To(BeEmpty())
+			} else {
+				Expect(src.Labels).To(Equal(tc.ExpectLabels))
+			}
+			if tc.ExpectAnnots == nil {
+				Expect(src.Annotations).To(BeEmpty())
+			} else {
+				Expect(src.Annotations).To(Equal(tc.ExpectAnnots))
+			}
+			// Spec and OwnerReferences must not be touched by the in-place path.
+			Expect(src.Spec.HardwareDetails).To(Equal(tc.OriginalDetails))
+			Expect(src.OwnerReferences).To(Equal(tc.OriginalOwnerRefs))
+		},
+		Entry("Source missing: no-op", testCaseSyncInPlace{
+			HostClaim: NewHostclaim(HostclaimName).SetAssociatedBMH(HostclaimNamespace, "bmh").Build(),
+		}),
+		Entry("Write filtered labels/annotations + bound annotation onto source HD", testCaseSyncInPlace{
+			HostClaim: NewHostclaim(HostclaimName).SetAssociatedBMH(HostclaimNamespace, "bmh").Build(),
+			SourceHardware: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "bmh",
+					Namespace: HostclaimNamespace,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "metal3.io/v1alpha1", Kind: "BareMetalHost",
+						Name: "bmh", UID: "bmh-uid",
+					}},
+				},
+				Spec: metal3api.HardwareDataSpec{HardwareDetails: &metal3api.HardwareDetails{Hostname: "untouched"}},
+			},
+			BMHLabels:       map[string]string{"metal3.io/drop": "x", "keep": "v"},
+			BMHAnnotations:  map[string]string{"kubernetes.io/arch": "amd64", "note": "hi"},
+			OriginalDetails: &metal3api.HardwareDetails{Hostname: "untouched"},
+			OriginalOwnerRefs: []metav1.OwnerReference{{
+				APIVersion: "metal3.io/v1alpha1", Kind: "BareMetalHost",
+				Name: "bmh", UID: "bmh-uid",
+			}},
+			ExpectLabels: map[string]string{"keep": "v"},
+			ExpectAnnots: map[string]string{
+				"note":                   "hi",
+				HostClaimBoundAnnotation: HostclaimNamespace + "/" + HostclaimName,
+			},
+		}),
+		Entry("No-op when metadata already matches (bound annotation preserved)", testCaseSyncInPlace{
+			HostClaim: NewHostclaim(HostclaimName).SetAssociatedBMH(HostclaimNamespace, "bmh").Build(),
+			SourceHardware: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "bmh", Namespace: HostclaimNamespace,
+					Labels:      map[string]string{"keep": "v"},
+					Annotations: map[string]string{HostClaimBoundAnnotation: HostclaimNamespace + "/" + HostclaimName},
+				},
+				Spec: metal3api.HardwareDataSpec{HardwareDetails: &metal3api.HardwareDetails{Hostname: "x"}},
+			},
+			BMHLabels:       map[string]string{"keep": "v"},
+			OriginalDetails: &metal3api.HardwareDetails{Hostname: "x"},
+			ExpectLabels:    map[string]string{"keep": "v"},
+			ExpectAnnots:    map[string]string{HostClaimBoundAnnotation: HostclaimNamespace + "/" + HostclaimName},
+		}),
+	)
+
+	type testCaseCleanupOnUnbind struct {
+		HostClaim    *metal3api.HostClaim
+		ReferencedHD *metal3api.HardwareData
+		SourceHD     *metal3api.HardwareData
+
+		ExpectReferencedHDDeleted bool
+		ExpectSourceLabels        map[string]string
+		ExpectSourceAnnots        map[string]string
+	}
+
+	DescribeTable("Test cleanupHardwareDataOnUnbind",
+		func(tc testCaseCleanupOnUnbind) {
+			ctx := context.TODO()
+			objs := []client.Object{tc.HostClaim}
+			if tc.ReferencedHD != nil {
+				objs = append(objs, tc.ReferencedHD)
+			}
+			if tc.SourceHD != nil {
+				objs = append(objs, tc.SourceHD)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+			hostMgr, ok := NewManager(fakeClient, GinkgoLogr, tc.HostClaim, fakeClient).(*Manager)
+			Expect(ok).To(BeTrue())
+			Expect(hostMgr.cleanupHardwareDataOnUnbind(ctx)).To(Succeed())
+
+			if tc.ReferencedHD != nil {
+				refHD := &metal3api.HardwareData{}
+				err := fakeClient.Get(ctx, client.ObjectKeyFromObject(tc.ReferencedHD), refHD)
+				if tc.ExpectReferencedHDDeleted {
+					Expect(k8serrors.IsNotFound(err)).To(BeTrue(), "referenced HD should have been deleted")
+				} else {
+					Expect(err).NotTo(HaveOccurred())
+					if tc.ExpectSourceLabels == nil {
+						Expect(refHD.Labels).To(BeEmpty())
+					} else {
+						Expect(refHD.Labels).To(Equal(tc.ExpectSourceLabels))
+					}
+					if tc.ExpectSourceAnnots == nil {
+						Expect(refHD.Annotations).To(BeEmpty())
+					} else {
+						Expect(refHD.Annotations).To(Equal(tc.ExpectSourceAnnots))
+					}
+					// Spec and OwnerReferences must not be touched on the same-ns path.
+					Expect(refHD.Spec.HardwareDetails).To(Equal(tc.ReferencedHD.Spec.HardwareDetails))
+					Expect(refHD.OwnerReferences).To(Equal(tc.ReferencedHD.OwnerReferences))
+				}
+			}
+			if tc.SourceHD != nil {
+				src := &metal3api.HardwareData{}
+				Expect(fakeClient.Get(ctx, client.ObjectKeyFromObject(tc.SourceHD), src)).To(Succeed())
+				if tc.ExpectSourceAnnots == nil {
+					Expect(src.Annotations).To(BeEmpty())
+				} else {
+					Expect(src.Annotations).To(Equal(tc.ExpectSourceAnnots))
+				}
+			}
+		},
+		Entry("Status.HardwareData nil: no-op", testCaseCleanupOnUnbind{
+			HostClaim: NewHostclaim(HostclaimName).Build(),
+		}),
+		Entry("Referenced HD missing: no-op", testCaseCleanupOnUnbind{
+			HostClaim: func() *metal3api.HostClaim {
+				hc := NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").Build()
+				hc.UID = "claim-uid"
+				hc.Status.HardwareData = &metal3api.ObjectReference{Namespace: HostclaimNamespace, Name: HostclaimName}
+				return hc
+			}(),
+		}),
+		Entry("Cross-ns: controlled copy is deleted; bound annotation stripped on source HD", testCaseCleanupOnUnbind{
+			HostClaim: func() *metal3api.HostClaim {
+				hc := NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").Build()
+				hc.UID = "claim-uid"
+				hc.Status.HardwareData = &metal3api.ObjectReference{Namespace: HostclaimNamespace, Name: HostclaimName}
+				return hc
+			}(),
+			ReferencedHD: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: HostclaimName, Namespace: HostclaimNamespace,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: metal3api.GroupVersion.Identifier(),
+						Kind:       "HostClaim",
+						Name:       HostclaimName,
+						UID:        "claim-uid",
+						Controller: ptr.To(true),
+					}},
+				},
+			},
+			SourceHD: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "bmh", Namespace: "ns",
+					Annotations: map[string]string{HostClaimBoundAnnotation: HostclaimNamespace + "/" + HostclaimName},
+				},
+			},
+			ExpectReferencedHDDeleted: true,
+			// Source HD annotations are now empty: the bound one was stripped.
+		}),
+		Entry("Cross-ns: controlled copy deleted; source HD left alone when ownership guard rejects", testCaseCleanupOnUnbind{
+			HostClaim: func() *metal3api.HostClaim {
+				hc := NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").Build()
+				hc.UID = "claim-uid"
+				hc.Status.HardwareData = &metal3api.ObjectReference{Namespace: HostclaimNamespace, Name: HostclaimName}
+				return hc
+			}(),
+			ReferencedHD: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: HostclaimName, Namespace: HostclaimNamespace,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: metal3api.GroupVersion.Identifier(),
+						Kind:       "HostClaim", Name: HostclaimName, UID: "claim-uid",
+						Controller: ptr.To(true),
+					}},
+				},
+			},
+			SourceHD: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "bmh", Namespace: "ns",
+					Annotations: map[string]string{HostClaimBoundAnnotation: HostclaimNamespace + "/other"},
+				},
+			},
+			ExpectReferencedHDDeleted: true,
+			ExpectSourceAnnots:        map[string]string{HostClaimBoundAnnotation: HostclaimNamespace + "/other"},
+		}),
+		Entry("Same-ns: HD not controlled by claim → clear labels/annotations", testCaseCleanupOnUnbind{
+			HostClaim: func() *metal3api.HostClaim {
+				hc := NewHostclaim(HostclaimName).SetAssociatedBMH(HostclaimNamespace, "bmh").Build()
+				hc.UID = "claim-uid"
+				hc.Status.HardwareData = &metal3api.ObjectReference{Namespace: HostclaimNamespace, Name: "bmh"}
+				return hc
+			}(),
+			ReferencedHD: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "bmh", Namespace: HostclaimNamespace,
+					Labels: map[string]string{"keep": "v"},
+					Annotations: map[string]string{
+						"note":                   "hi",
+						HostClaimBoundAnnotation: HostclaimNamespace + "/" + HostclaimName,
+					},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: metal3api.GroupVersion.Identifier(),
+						Kind:       "BareMetalHost", Name: "bmh", UID: "bmh-uid",
+						Controller: ptr.To(true),
+					}},
+				},
+				Spec: metal3api.HardwareDataSpec{HardwareDetails: &metal3api.HardwareDetails{Hostname: "preserve"}},
+			},
+			// ExpectReferencedHDDeleted false; labels/annotations wiped.
+		}),
+		Entry("Same-ns: ownership guard rejects (annotation points elsewhere) → HD left intact", testCaseCleanupOnUnbind{
+			HostClaim: func() *metal3api.HostClaim {
+				hc := NewHostclaim(HostclaimName).SetAssociatedBMH(HostclaimNamespace, "bmh").Build()
+				hc.UID = "claim-uid"
+				hc.Status.HardwareData = &metal3api.ObjectReference{Namespace: HostclaimNamespace, Name: "bmh"}
+				return hc
+			}(),
+			ReferencedHD: &metal3api.HardwareData{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "bmh", Namespace: HostclaimNamespace,
+					Labels: map[string]string{"keep": "v"},
+					Annotations: map[string]string{
+						"note":                   "hi",
+						HostClaimBoundAnnotation: HostclaimNamespace + "/other",
+					},
+				},
+				Spec: metal3api.HardwareDataSpec{HardwareDetails: &metal3api.HardwareDetails{Hostname: "preserve"}},
+			},
+			ExpectSourceLabels: map[string]string{"keep": "v"},
+			ExpectSourceAnnots: map[string]string{
+				"note":                   "hi",
+				HostClaimBoundAnnotation: HostclaimNamespace + "/other",
+			},
 		}),
 	)
 })

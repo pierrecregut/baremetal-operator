@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/big"
 	"regexp"
 	"slices"
@@ -78,6 +79,13 @@ const (
 	// from being moved until it is removed. Used to synchronize pause/status
 	// annotation application with clusterctl pivot operations.
 	BlockMoveAnnotation = "clusterctl.cluster.x-k8s.io/block-move"
+	// HostClaimBoundAnnotation records "<namespace>/<name>" of the HostClaim that
+	// is bound to a source HardwareData. It is written during sync so that
+	// HardwareDataToHostClaims can enqueue the claim without an API lookup,
+	// and removed during cleanup so stale events do not fire. It lives on the
+	// SOURCE HD only — the cross-namespace copy's filterMetadata drops it
+	// (metal3.io/ prefix), so copy events never trigger spurious enqueues.
+	HostClaimBoundAnnotation = "metal3.io/hostclaim-bound"
 
 	hostclaimRebootPrefix = metal3api.RebootAnnotationPrefix + "/"
 	bmhRebootPrefix       = hostclaimRebootPrefix + RebootHostClaimOwnedPrefix
@@ -287,7 +295,6 @@ func (m *Manager) RemovePauseAnnotation(ctx context.Context) error {
 		m.Log.Info("BareMetalHost is paused by user, not removing pause annotation",
 			LogFieldHost, bmh.Name,
 			LogFieldNamespace, bmh.Namespace)
-
 	}
 	return nil
 }
@@ -490,6 +497,14 @@ func (m *Manager) Delete(ctx context.Context) error {
 		}
 	}
 
+	// Cleanup HardwareData state before we lose the BMH reference. In
+	// cross-namespace, owner-ref GC will remove the copy once this HostClaim
+	// is deleted — a NotFound here is fine. In same-namespace, this is
+	// REQUIRED to strip the labels/annotations we wrote onto the source HD.
+	if err := m.cleanupHardwareDataOnUnbind(ctx); err != nil {
+		return err
+	}
+
 	bmh.Spec.ConsumerRef = nil
 	if err := m.client.Update(ctx, bmh); err != nil {
 		log.Error(err, "Error during removal of BareMetalHost consumerRef")
@@ -510,7 +525,7 @@ func (m *Manager) Update(ctx context.Context) error {
 			// The reference to BareMetalHost is wrong (bmh gone, bad ConsumerRef).
 			// Reset status to get a new association. returns nil as the
 			// recovery can be considered as a normal transition.
-			m.clearDisassociatedHostClaim()
+			m.clearDisassociatedHostClaim(ctx)
 			return nil
 		}
 		return err
@@ -549,6 +564,13 @@ func (m *Manager) Update(ctx context.Context) error {
 		return sanitizedErr
 	}
 
+	if syncErr := m.syncHardwareData(ctx, bmh); syncErr != nil {
+		m.Log.Error(syncErr, "Failed to synchronize HardwareData copy")
+		m.SetConditionHostToFalse(
+			metal3api.SynchronizedCondition, metal3api.HardwareDataSyncFailedReason, syncErr.Error())
+		return syncErr
+	}
+
 	if imageMismatch {
 		m.Log.Info("BareMetalHost provisioned with a different image; in-place upgrade is not supported",
 			"bmhImage", bmh.Spec.Image, "hostClaimImage", m.HostClaim.Spec.Image)
@@ -574,7 +596,13 @@ func (m *Manager) Update(ctx context.Context) error {
 
 // clearDisassociatedHostClaim resets the status of the HostClaim (references and conditions)
 // when the associated BareMetalHost is gone so that it can be associated again.
-func (m *Manager) clearDisassociatedHostClaim() {
+// HardwareData is cleaned and deleted if it is a copy for the HostClaim.
+func (m *Manager) clearDisassociatedHostClaim(ctx context.Context) {
+	if err := m.cleanupHardwareDataOnUnbind(ctx); err != nil {
+		// Non-fatal: cleanup will be retried next reconciliation (and
+		// overwritten/created on re-association). Logged, not returned.
+		m.Log.Error(err, "Failed to clean up HardwareData on disassociation")
+	}
 	hostClaim := m.HostClaim
 	hostClaim.Status.BareMetalHost = nil
 	hostClaim.Status.HardwareData = nil
@@ -679,6 +707,254 @@ func (m *Manager) setBmhSpec(bmh *metal3api.BareMetalHost) (updated, imageMismat
 	}
 
 	return updated, imageMismatch
+}
+
+// syncHardwareData propagates the BareMetalHost-side HardwareData so that the
+// hardware inventory is visible to the claim's tenant. It also copies
+// BareMetalHost metadata to HardwareData so that they are also visible.
+//
+// When the namespaces of HostClaim and BareMetalHost are different an actual
+// copy is done and the HostClaim takes ownership of the copy.
+// When the namespaces are the same, no copy is done but metadata are propagated.
+//
+// Labels/annotations are filtered to drop metal3.io/ and *.kubernetes.io domains.
+func (m *Manager) syncHardwareData(ctx context.Context, bmh *metal3api.BareMetalHost) error {
+	src := &metal3api.HardwareData{}
+	srcKey := types.NamespacedName{Namespace: bmh.Namespace, Name: bmh.Name}
+	if err := m.client.Get(ctx, srcKey, src); err != nil {
+		if k8serrors.IsNotFound(err) {
+			// Will retry in another reconcile. Does not delete anything.
+			return nil
+		}
+		m.Log.Error(err, "Failure during access to HardwareData")
+		return fmt.Errorf("failed to get source HardwareData: %w", err)
+	}
+
+	if err := m.ensureBoundAnnotation(ctx, src); err != nil {
+		m.Log.Error(err, "Cannot set back link to HostClaim on HardwareData")
+		return err
+	}
+
+	if bmh.Namespace == m.HostClaim.Namespace {
+		return m.syncHardwareDataInPlace(ctx, bmh, src)
+	}
+	return m.syncHardwareDataCopy(ctx, bmh, src)
+}
+
+// ensureBoundAnnotation annotate source HardwareData so that it can trigger
+// reconcile events when modified.
+func (m *Manager) ensureBoundAnnotation(ctx context.Context, src *metal3api.HardwareData) error {
+	if src.Annotations[HostClaimBoundAnnotation] == m.qualifiedClaimName() {
+		return nil
+	}
+	helper, err := patch.NewHelper(src, m.client)
+	if err != nil {
+		return err
+	}
+	if src.Annotations == nil {
+		src.Annotations = map[string]string{}
+	}
+	src.Annotations[HostClaimBoundAnnotation] = m.qualifiedClaimName()
+	return helper.Patch(ctx, src)
+}
+
+// syncHardwareDataCopy creates or updates the HardwareData copy that lives in
+// the HostClaim's namespace (cross-namespace case).
+func (m *Manager) syncHardwareDataCopy(ctx context.Context, bmh *metal3api.BareMetalHost, src *metal3api.HardwareData) error {
+	dst := &metal3api.HardwareData{}
+	dstKey := types.NamespacedName{Namespace: m.HostClaim.Namespace, Name: m.HostClaim.Name}
+	err := m.client.Get(ctx, dstKey, dst)
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get HardwareData copy: %w", err)
+	}
+
+	desiredLabels := filterMetadata(bmh.Labels)
+	desiredAnnotations := filterMetadata(bmh.Annotations)
+	desiredDetails := src.Spec.HardwareDetails.DeepCopy()
+
+	if k8serrors.IsNotFound(err) {
+		dst = &metal3api.HardwareData{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "HardwareData",
+				APIVersion: metal3api.GroupVersion.Identifier(),
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            m.HostClaim.Name,
+				Namespace:       m.HostClaim.Namespace,
+				Labels:          desiredLabels,
+				Annotations:     desiredAnnotations,
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(m.HostClaim, metal3api.GroupVersion.WithKind("HostClaim"))},
+			},
+			Spec: metal3api.HardwareDataSpec{HardwareDetails: desiredDetails},
+		}
+		if createErr := m.client.Create(ctx, dst); createErr != nil {
+			return fmt.Errorf("failed to create HardwareData copy: %w", createErr)
+		}
+		return nil
+	}
+
+	if maps.Equal(dst.Labels, desiredLabels) &&
+		maps.Equal(dst.Annotations, desiredAnnotations) &&
+		equality.Semantic.DeepEqual(dst.Spec.HardwareDetails, desiredDetails) {
+		return nil
+	}
+	dst.Labels = desiredLabels
+	dst.Annotations = desiredAnnotations
+	dst.Spec.HardwareDetails = desiredDetails
+	if updateErr := m.client.Update(ctx, dst); updateErr != nil {
+		return fmt.Errorf("failed to update HardwareData copy: %w", updateErr)
+	}
+	return nil
+}
+
+// syncHardwareDataInPlace propagates the filtered BMH labels/annotations
+// from the BareMetalHost to its own HardwareData.
+func (m *Manager) syncHardwareDataInPlace(ctx context.Context, bmh *metal3api.BareMetalHost, src *metal3api.HardwareData) error {
+	newLabels := filterMetadata(bmh.Labels)
+	newAnnotations := filterMetadata(bmh.Annotations)
+	// Puts back the bound annotation.
+	if bound, ok := src.Annotations[HostClaimBoundAnnotation]; ok {
+		if newAnnotations == nil {
+			newAnnotations = map[string]string{}
+		}
+		newAnnotations[HostClaimBoundAnnotation] = bound
+	}
+	if maps.Equal(src.Labels, newLabels) && maps.Equal(src.Annotations, newAnnotations) {
+		return nil
+	}
+	helper, err := patch.NewHelper(src, m.client)
+	if err != nil {
+		return err
+	}
+	src.Labels = newLabels
+	src.Annotations = newAnnotations
+	if patchErr := helper.Patch(ctx, src); patchErr != nil {
+		return fmt.Errorf("failed to patch source HardwareData metadata: %w", patchErr)
+	}
+	return nil
+}
+
+// cleanupHardwareDataOnUnbind reverses whatever syncHardwareData did while the
+// HostClaim was bound to its BareMetalHost. It is driven by the HD pointed at
+// by Status.HardwareData, and dispatches on whether that HD is controlled by
+// this HostClaim:
+//
+//   - Status.HardwareData nil: nothing was synced, no-op.
+//   - HD controlled by this HostClaim: it is the cross-namespace copy. Delete
+//     it. Then, if Status.BareMetalHost is in a different namespace, strip the
+//     HostClaimBoundAnnotation from the source HD so stale HD events do not
+//     re-enqueue this claim.
+//   - HD not controlled by this HostClaim: it is the source HD itself
+//     (same-namespace case). Clear its labels and annotations (Spec and
+//     OwnerReferences untouched).
+//
+// Every write to the source HD is ownership-guarded by the bound annotation:
+// if HostClaimBoundAnnotation now points at a different claim (A→B handoff),
+// we leave the source HD alone so B's routing hint stays intact. Missing HDs
+// are no-ops.
+func (m *Manager) cleanupHardwareDataOnUnbind(ctx context.Context) error {
+	hdRef := m.HostClaim.Status.HardwareData
+	if hdRef == nil {
+		return nil
+	}
+
+	hd := &metal3api.HardwareData{}
+	if err := m.client.Get(ctx, types.NamespacedName{Namespace: hdRef.Namespace, Name: hdRef.Name}, hd); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get HardwareData for cleanup: %w", err)
+	}
+
+	if metav1.IsControlledBy(hd, m.HostClaim) {
+		// The HD is the copy we created. Delete it, then strip the bound
+		// annotation from the source HD when it lives in a different
+		// namespace (cross-namespace case).
+		if err := m.client.Delete(ctx, hd); err != nil && !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete HardwareData copy: %w", err)
+		}
+		bmhRef := m.HostClaim.Status.BareMetalHost
+		if bmhRef == nil || bmhRef.Namespace == m.HostClaim.Namespace {
+			return nil
+		}
+		return m.stripBoundAnnotation(ctx, bmhRef.Namespace, bmhRef.Name)
+	}
+
+	// Not our copy: this is the source HD (same-namespace case). Clear the
+	// labels/annotations we wrote, ownership-guarded.
+	return m.clearSourceHDMetadata(ctx, hd)
+}
+
+// stripBoundAnnotation removes HostClaimBoundAnnotation from the source HD at
+// (namespace, name) if it still points at THIS HostClaim. A missing HD or an
+// annotation pointing elsewhere (A→B handoff) is a no-op.
+func (m *Manager) stripBoundAnnotation(ctx context.Context, namespace, name string) error {
+	src := &metal3api.HardwareData{}
+	if err := m.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, src); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get source HardwareData for annotation strip: %w", err)
+	}
+	if src.Annotations[HostClaimBoundAnnotation] != m.qualifiedClaimName() {
+		return nil
+	}
+	helper, err := patch.NewHelper(src, m.client)
+	if err != nil {
+		return err
+	}
+	delete(src.Annotations, HostClaimBoundAnnotation)
+	if patchErr := helper.Patch(ctx, src); patchErr != nil {
+		return fmt.Errorf("failed to strip HostClaim-bound annotation: %w", patchErr)
+	}
+	return nil
+}
+
+// clearSourceHDMetadata nukes the source HD's labels and annotations (same-ns
+// cleanup). Ownership-guarded by the bound annotation.
+func (m *Manager) clearSourceHDMetadata(ctx context.Context, src *metal3api.HardwareData) error {
+	if src.Annotations[HostClaimBoundAnnotation] != m.qualifiedClaimName() {
+		return nil
+	}
+	if len(src.Labels) == 0 && len(src.Annotations) == 0 {
+		return nil
+	}
+	helper, err := patch.NewHelper(src, m.client)
+	if err != nil {
+		return err
+	}
+	src.Labels = nil
+	src.Annotations = nil
+	if patchErr := helper.Patch(ctx, src); patchErr != nil {
+		return fmt.Errorf("failed to clear source HardwareData metadata: %w", patchErr)
+	}
+	return nil
+}
+
+// qualifiedClaimName returns "<claim-namespace>/<claim-name>" — the value the
+// manager writes into HostClaimBoundAnnotation.
+func (m *Manager) qualifiedClaimName() string {
+	return m.HostClaim.Namespace + "/" + m.HostClaim.Name
+}
+
+// filterMetadata removes labels/annotations whose domain is a
+// metal3.io or kubernetes.io.
+func filterMetadata(metadata map[string]string) map[string]string {
+	if metadata == nil {
+		return nil
+	}
+
+	result := map[string]string{}
+	for key, value := range metadata {
+		domain, _, qualified := strings.Cut(key, "/")
+		if qualified {
+			if domain == "metal3.io" || domain == "kubernetes.io" || strings.HasSuffix(domain, ".kubernetes.io") {
+				continue
+			}
+		}
+		result[key] = value
+	}
+	return result
 }
 
 // consumerRefMatches returns a boolean based on whether the consumer
@@ -961,9 +1237,17 @@ func (m *Manager) updateHostClaimStatus(bmh *metal3api.BareMetalHost) {
 	hostOld := m.HostClaim.Status.DeepCopy()
 
 	m.HostClaim.Status.PoweredOn = bmh.Status.PoweredOn
-	m.HostClaim.Status.HardwareData = &metal3api.ObjectReference{
-		Namespace: bmh.Namespace,
-		Name:      bmh.Name,
+	if bmh.Namespace == m.HostClaim.Namespace {
+		// Same-namespace (pivot): tenant sees the source HD directly, no copy.
+		m.HostClaim.Status.HardwareData = &metal3api.ObjectReference{
+			Namespace: bmh.Namespace,
+			Name:      bmh.Name,
+		}
+	} else {
+		m.HostClaim.Status.HardwareData = &metal3api.ObjectReference{
+			Namespace: m.HostClaim.Namespace,
+			Name:      m.HostClaim.Name,
+		}
 	}
 	conditions.SetMirrorCondition(bmh, m.HostClaim, metal3api.AvailableForProvisioningCondition)
 	conditions.SetMirrorCondition(bmh, m.HostClaim, metal3api.ProvisionedCondition)

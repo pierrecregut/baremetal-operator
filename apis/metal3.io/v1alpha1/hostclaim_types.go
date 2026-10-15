@@ -71,6 +71,9 @@ const (
 	// already provisioned with a different image than the one requested by the HostClaim.
 	// Image upgrade requires deprovisioning first.
 	OtherImageProvisionedReason = "OtherImageProvisioned"
+	// HardwareDataSyncFailedReason is the reason used when the HostClaim's HardwareData
+	// copy cannot be created or updated in the HostClaim namespace.
+	HardwareDataSyncFailedReason = "HardwareDataSyncFailed"
 )
 
 // HostClaimSpec defines the desired state of HostClaim.
