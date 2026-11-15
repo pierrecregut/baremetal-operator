@@ -372,6 +372,22 @@ func (m *Manager) getAssociatedBMH(ctx context.Context) (*metal3api.BareMetalHos
 		return nil, err
 	}
 	if !consumerRefMatches(bmh.Spec.ConsumerRef, hostClaim) {
+		// To avoid spurious disassociation due to cache lag. Goes through
+		// the APIReader.
+		if bmh.Spec.ConsumerRef == nil && m.APIReader != nil {
+			log.Info("Cached BareMetalHost has no consumerRef: confirm with APIReader")
+			directBMH := metal3api.BareMetalHost{}
+			if err := m.APIReader.Get(ctx, key, &directBMH); err != nil {
+				if k8serrors.IsNotFound(err) {
+					log.Info("Linked host not found (APIReader)")
+					return nil, ErrNoBMH
+				}
+				return nil, err // transient error
+			}
+			if consumerRefMatches(directBMH.Spec.ConsumerRef, hostClaim) {
+				return &directBMH, nil
+			}
+		}
 		log.Info("The consumer ref does not point to the hostClaim", LogFieldConsumerRef, bmh.Spec.ConsumerRef)
 		return nil, ErrNoBMH
 	}

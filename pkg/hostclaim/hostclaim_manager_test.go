@@ -644,6 +644,87 @@ var _ = Describe("HostClaim manager", func() {
 		}),
 	)
 
+	// unit tests on getAssociatedBMH taking into account that the cached BMH may be out
+	// of sync with the real BMH from the APIReader. Two fake clients are used to simulate the
+	// difference.
+	var otherConsumerRef = corev1.ObjectReference{
+		Name:       "other",
+		Namespace:  HostclaimNamespace,
+		Kind:       HostClaimKind,
+		APIVersion: metal3api.GroupVersion.String(),
+	}
+	type testCaseGetAssociatedBMH struct {
+		CachedConsumerRef *corev1.ObjectReference
+		RealConsumerRef   *corev1.ObjectReference
+		RealBMHMissing    bool
+		ExpectConsumerRef bool
+		ExpectError       error
+	}
+	DescribeTable("test getAssociatedBMH cache staleness",
+		func(tc testCaseGetAssociatedBMH) {
+			ctx := context.TODO()
+			hc := NewHostclaim(HostclaimName).SetAssociatedBMH("ns", "bmh").Build()
+
+			cachedBmhBuilder := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable)
+			if tc.CachedConsumerRef != nil {
+				cachedBmhBuilder = cachedBmhBuilder.SetConsumerRef(*tc.CachedConsumerRef)
+			}
+			cachedBmh := cachedBmhBuilder.Build()
+			cacheClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(hc, cachedBmh).Build()
+
+			apiObjects := []client.Object{}
+			if !tc.RealBMHMissing {
+				realBmhBuilder := NewBaremetalhost("bmh", "ns", metal3api.StateAvailable)
+				if tc.RealConsumerRef != nil {
+					realBmhBuilder = realBmhBuilder.SetConsumerRef(*tc.RealConsumerRef)
+				}
+				realBmh := realBmhBuilder.Build()
+				apiObjects = append(apiObjects, realBmh)
+			}
+			apiClient := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(apiObjects...).Build()
+
+			hostMgr, ok := NewManager(cacheClient, GinkgoLogr, hc, apiClient).(*Manager)
+			Expect(ok).To(BeTrue())
+
+			bmh, err := hostMgr.getAssociatedBMH(ctx)
+			if tc.ExpectError != nil {
+				Expect(errors.Is(err, tc.ExpectError)).To(BeTrue())
+				Expect(bmh).To(BeNil())
+				return
+			}
+			Expect(err).NotTo(HaveOccurred())
+			Expect(bmh).NotTo(BeNil())
+			if tc.ExpectConsumerRef {
+				Expect(bmh.Spec.ConsumerRef).NotTo(BeNil())
+			}
+		},
+		Entry("standard successful call (cache updated)", testCaseGetAssociatedBMH{
+			CachedConsumerRef: &defaultConsumerRef,
+			RealBMHMissing:    true,
+			ExpectConsumerRef: true,
+		}),
+		Entry("successful call through APIReader", testCaseGetAssociatedBMH{
+			CachedConsumerRef: nil,
+			RealConsumerRef:   &defaultConsumerRef,
+			ExpectConsumerRef: true,
+		}),
+		Entry("No association even through APIReader on consumerRef", testCaseGetAssociatedBMH{
+			CachedConsumerRef: nil,
+			RealConsumerRef:   nil,
+			ExpectError:       ErrNoBMH,
+		}),
+		Entry("BMH has disappeared on APIReader call", testCaseGetAssociatedBMH{
+			CachedConsumerRef: nil,
+			RealBMHMissing:    true,
+			ExpectError:       ErrNoBMH,
+		}),
+		Entry("real conflict in cache (no check on APIReader)", testCaseGetAssociatedBMH{
+			CachedConsumerRef: &otherConsumerRef,
+			RealConsumerRef:   &defaultConsumerRef,
+			ExpectError:       ErrNoBMH,
+		}),
+	)
+
 	type testCaseDelete struct {
 		HostClaim           *metal3api.HostClaim
 		BareMetalHost       *metal3api.BareMetalHost
