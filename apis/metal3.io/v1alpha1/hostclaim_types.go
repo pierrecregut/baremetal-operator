@@ -67,10 +67,6 @@ const (
 	// BareMetalHostNotSynchronizedReason is the reason used when the synchronization of BareMetalHost state
 	// is not successful.
 	BareMetalHostNotSynchronizedReason = "BareMetalHostNotSynchronized"
-	// OtherImageProvisionedReason is the reason used when the associated BareMetalHost is
-	// already provisioned with a different image than the one requested by the HostClaim.
-	// Image upgrade requires deprovisioning first.
-	OtherImageProvisionedReason = "OtherImageProvisioned"
 
 	// HostReadyCondition is a mirror of the associated Host Ready condition.
 	HostReadyCondition = "HostReady"

@@ -294,7 +294,7 @@ func (m *Manager) Update(ctx context.Context) error {
 	}
 
 	// ensure that the BMH specs are correctly set.
-	updated, imageMismatch := m.setBmhSpec(bmh)
+	updated := m.setBmhSpec(bmh)
 
 	if updated {
 		m.Log.Info("Updating the BareMetalHost spec: changes detected.")
@@ -312,15 +312,7 @@ func (m *Manager) Update(ctx context.Context) error {
 		return sanitizedErr
 	}
 
-	if imageMismatch {
-		m.Log.Info("BareMetalHost provisioned with a different image; in-place upgrade is not supported",
-			"bmhImage", bmh.Spec.Image, "hostClaimImage", m.HostClaim.Spec.Image)
-		m.SetConditionHostToFalse(
-			metal3api.SynchronizedCondition, metal3api.OtherImageProvisionedReason,
-			"BareMetalHost is provisioned with a different image; deprovision it to change the image")
-	} else {
-		m.SetConditionHostToTrue(metal3api.SynchronizedCondition, metal3api.ConfigurationSyncedReason)
-	}
+	m.SetConditionHostToTrue(metal3api.SynchronizedCondition, metal3api.ConfigurationSyncedReason)
 
 	m.updateHostClaimStatus(bmh)
 
@@ -410,23 +402,23 @@ func hideConflictError(err error) error {
 }
 
 // setBmhSpec will ensure the host's Spec is set according to the hostclaim's
-// details. It returns updated=true if any field of bmh.Spec was changed, and
-// imageMismatch=true if the BMH is already provisioned with an image that
-// differs from the HostClaim's image (in-place upgrade is not supported).
-func (m *Manager) setBmhSpec(bmh *metal3api.BareMetalHost) (updated, imageMismatch bool) {
-	// A host with an existing image is already provisioned and
-	// upgrades are not supported at this time. To re-provision a
-	// host, we must fully deprovision it and then provision it again.
-	if bmh.Spec.Image == nil && m.HostClaim.Spec.Image != nil {
-		updated = true
-		bmh.Spec.Image = m.HostClaim.Spec.Image.DeepCopy()
-	} else if m.HostClaim.Spec.Image == nil {
+// details. It returns updated=true if any field of bmh.Spec was changed.
+// An image change is always propagated directly.
+func (m *Manager) setBmhSpec(bmh *metal3api.BareMetalHost) (updated bool) {
+	if m.HostClaim.Spec.Image == nil {
 		if bmh.Spec.Image != nil {
 			updated = true
 			bmh.Spec.Image = nil
 		}
-	} else if !equality.Semantic.DeepEqual(bmh.Spec.Image, m.HostClaim.Spec.Image) {
-		imageMismatch = true
+	} else {
+		normalizedImage := m.HostClaim.Spec.Image.DeepCopy()
+		// Reset the OCI credentials secret name to nil. BMH will access it as other
+		// hostclaim's secrets directly.
+		normalizedImage.OCIAuthSecretName = nil
+		if bmh.Spec.Image == nil || !equality.Semantic.DeepEqual(bmh.Spec.Image, normalizedImage) {
+			updated = true
+			bmh.Spec.Image = normalizedImage
+		}
 	}
 
 	// Propagate custom deploy.
@@ -450,7 +442,7 @@ func (m *Manager) setBmhSpec(bmh *metal3api.BareMetalHost) (updated, imageMismat
 		bmh.Spec.Online = m.HostClaim.Spec.PoweredOn
 	}
 
-	return updated, imageMismatch
+	return updated
 }
 
 // consumerRefMatches returns a boolean based on whether the consumer

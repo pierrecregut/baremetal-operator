@@ -425,11 +425,11 @@ var _ = Describe("HostClaim manager", func() {
 
 	type testCaseSetBMHSpec struct {
 		SetImage         bool
+		HcImage          *metal3api.Image
 		SetCustomDeploy  bool
 		SetPoweredOn     bool
 		BmhImage         *metal3api.Image
 		Updated          bool
-		ExpectImageIssue bool
 		ExpectedBmhImage *metal3api.Image
 	}
 
@@ -437,7 +437,11 @@ var _ = Describe("HostClaim manager", func() {
 		func(tc testCaseSetBMHSpec) {
 			hcBuilder := NewHostclaim(HostclaimName)
 			if tc.SetImage {
-				hcBuilder = hcBuilder.SetImage(defaultImage)
+				image := defaultImage
+				if tc.HcImage != nil {
+					image = *tc.HcImage
+				}
+				hcBuilder = hcBuilder.SetImage(image)
 			}
 			if tc.SetCustomDeploy {
 				hcBuilder = hcBuilder.SetCustomDeploy("custom")
@@ -453,7 +457,7 @@ var _ = Describe("HostClaim manager", func() {
 			bmh := bmhBuilder.Build()
 			hostMgr, ok := NewManager(nil, GinkgoLogr, hostClaim, nil).(*Manager)
 			Expect(ok).To(BeTrue())
-			updated, imageMismatch := hostMgr.setBmhSpec(bmh)
+			updated := hostMgr.setBmhSpec(bmh)
 			if tc.ExpectedBmhImage != nil {
 				Expect(bmh.Spec.Image).NotTo(BeNil())
 				Expect(*bmh.Spec.Image).To(Equal(*tc.ExpectedBmhImage))
@@ -467,10 +471,8 @@ var _ = Describe("HostClaim manager", func() {
 			}
 			Expect(bmh.Spec.Online).To(Equal(tc.SetPoweredOn))
 			Expect(updated).To(Equal(tc.Updated))
-			Expect(imageMismatch).To(Equal(tc.ExpectImageIssue))
-			updated, imageMismatch = hostMgr.setBmhSpec(bmh)
+			updated = hostMgr.setBmhSpec(bmh)
 			Expect(updated).To(BeFalse())
-			Expect(imageMismatch).To(Equal(tc.ExpectImageIssue))
 		},
 		Entry("set image", testCaseSetBMHSpec{
 			SetImage: true,
@@ -484,11 +486,20 @@ var _ = Describe("HostClaim manager", func() {
 			SetPoweredOn: true,
 			Updated:      true,
 		}),
-		Entry("image mismatch keeps the bmh image", testCaseSetBMHSpec{
+		Entry("image change replaces the bmh image", testCaseSetBMHSpec{
 			SetImage:         true,
 			BmhImage:         &metal3api.Image{URL: "other"},
-			ExpectedBmhImage: &metal3api.Image{URL: "other"},
-			ExpectImageIssue: true,
+			ExpectedBmhImage: &defaultImage,
+			Updated:          true,
+		}),
+		Entry("OCIAuthSecretName is stripped", testCaseSetBMHSpec{
+			SetImage: true,
+			HcImage: &metal3api.Image{
+				URL:               defaultImage.URL,
+				OCIAuthSecretName: new("hostclaim-local-secret"),
+			},
+			ExpectedBmhImage: &defaultImage,
+			Updated:          true,
 		}),
 	)
 
@@ -603,14 +614,14 @@ var _ = Describe("HostClaim manager", func() {
 			ExpectBmhOnline:    true,
 			ExpectHardwareData: true,
 		}),
-		Entry("Image mismatch keeps BMH image and sets Synchronized=False", testCaseUpdate{
+		Entry("Image change on an already-provisioned BMH is propagated directly", testCaseUpdate{
 			HostClaim: NewHostclaim(HostclaimName).SetImage(metal3api.Image{URL: "new"}).
 				SetAssociatedBMH("ns", "bmh").Build(),
 			BareMetalHost: NewBaremetalhost("bmh", "ns", metal3api.StateProvisioned).
 				SetConsumerRef(defaultConsumerRef).
 				SetImage(metal3api.Image{URL: "old"}).Build(),
-			ExpectSyncReason:   metal3api.OtherImageProvisionedReason,
-			ExpectBmhImageURL:  "old",
+			ExpectSyncReason:   metal3api.ConfigurationSyncedReason,
+			ExpectBmhImageURL:  "new",
 			ExpectHardwareData: true,
 		}),
 		Entry("Mirrors BMH power state into hostClaim status", testCaseUpdate{
