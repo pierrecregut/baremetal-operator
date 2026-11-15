@@ -26,6 +26,19 @@ const (
 	// Finalizer for HostClaims that are handled by the hostclaim_controller.
 	HostClaimFinalizer = "metal3.io/hostclaim"
 
+	// DisassociatedLabel marks a HostClaim that lost its association with its BareMetalHost and is
+	// being held for manual review before a new association is performed. Remove this label once
+	// the situation has been investigated to let reassociation proceed.
+	DisassociatedLabel = "hostclaim.metal3.io/disassociated"
+
+	// DisassociationPolicyAnnotation controls how a HostClaim reacts to losing its association with
+	// its BareMetalHost. The default (annotation absent, or set to any value other than
+	// DisassociationPolicyAutoRecover) sets DisassociatedLabel and waits for manual review.
+	DisassociationPolicyAnnotation = "hostclaim.metal3.io/disassociation-policy"
+	// DisassociationPolicyAutoRecover is the DisassociationPolicyAnnotation value that opts a
+	// HostClaim out of manual-review fencing and performs automatic reassociation.
+	DisassociationPolicyAutoRecover = "auto-recover"
+
 	// AssociateCondition documents the status of the association of HostClaim with a BareMetalHost.
 	AssociatedCondition = "Associated"
 
@@ -51,6 +64,11 @@ const (
 	HostClaimDeletingReason = "HostClaimDeleting"
 	// HostClaimDeletionFailedReason is used when the deletion of hostclaim encountered an unexpected error.
 	HostClaimDeletionFailedReason = "HostClaimDeletionFailed"
+	// UnexpectedDisassociationReason is the AssociatedCondition reason set when a HostClaim's
+	// BareMetalHost association was lost outside of normal deletion/retry flow (the BareMetalHost
+	// disappeared, or its ConsumerRef no longer points back to this claim). The condition message
+	// explains that manual review is required; see DisassociatedLabel.
+	UnexpectedDisassociationReason = "UnexpectedDisassociation"
 
 	// SynchronizedCondition documents the status of the transfer of information from the
 	// HostClaim to the BareMetalHost.
