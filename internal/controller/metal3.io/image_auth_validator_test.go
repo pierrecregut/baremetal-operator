@@ -50,7 +50,7 @@ func TestValidate_SecretNotFound(t *testing.T) {
 		},
 	}
 
-	credentials, err := validator.Validate(t.Context(), bmh, secretManager)
+	credentials, err := validator.Validate(t.Context(), bmh, bmh.Spec.Image, bmh.Namespace, secretName, secretManager)
 	if err == nil {
 		t.Fatal("expected error when secret is not found")
 	}
@@ -95,7 +95,7 @@ func TestValidate_SecretForbidden(t *testing.T) {
 		},
 	}
 
-	credentials, err := validator.Validate(t.Context(), bmh, secretManager)
+	credentials, err := validator.Validate(t.Context(), bmh, bmh.Spec.Image, bmh.Namespace, secretName, secretManager)
 	if err == nil {
 		t.Fatal("expected error when secret is forbidden")
 	}
@@ -139,7 +139,7 @@ func TestValidate_TransientRetrievalNotWrapped(t *testing.T) {
 		},
 	}
 
-	_, err := validator.Validate(t.Context(), bmh, secretManager)
+	_, err := validator.Validate(t.Context(), bmh, bmh.Spec.Image, bmh.Namespace, secretName, secretManager)
 	if err == nil {
 		t.Fatal("expected error when secret retrieval fails transiently")
 	}
@@ -202,7 +202,7 @@ func TestValidate_WrongSecretType(t *testing.T) {
 		},
 	}
 
-	credentials, err := validator.Validate(t.Context(), bmh, secretManager)
+	credentials, err := validator.Validate(t.Context(), bmh, bmh.Spec.Image, bmh.Namespace, secretName, secretManager)
 	if err == nil {
 		t.Fatal("expected error for wrong secret type")
 	}
@@ -217,7 +217,7 @@ func TestValidate_WrongSecretType(t *testing.T) {
 	// Assert that warning event was recorded.
 	select {
 	case event := <-recorder.Events:
-		expectedEvent := "Warning ImageAuthFormatUnsupported Secret \"my-secret\" has unsupported type \"Opaque\""
+		expectedEvent := "Warning ImageAuthFormatUnsupported Secret \"default/my-secret\" has unsupported type \"Opaque\""
 		if event != expectedEvent {
 			t.Errorf("expected event %q, got %q", expectedEvent, event)
 		}
@@ -274,7 +274,7 @@ func TestValidate_ValidDockerConfigJSON(t *testing.T) {
 		},
 	}
 
-	credentials, err := validator.Validate(t.Context(), bmh, secretManager)
+	credentials, err := validator.Validate(t.Context(), bmh, bmh.Spec.Image, bmh.Namespace, secretName, secretManager)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestValidate_RegistryNotInSecret(t *testing.T) {
 		},
 	}
 
-	credentials, err := validator.Validate(t.Context(), bmh, secretManager)
+	credentials, err := validator.Validate(t.Context(), bmh, bmh.Spec.Image, bmh.Namespace, secretName, secretManager)
 	if err == nil {
 		t.Fatal("expected error when registry is not in secret")
 	}
@@ -384,7 +384,7 @@ func TestValidate_NonOCIImageWithSecret(t *testing.T) {
 		},
 	}
 
-	credentials, err := validator.Validate(t.Context(), bmh, secretutils.SecretManager{})
+	credentials, err := validator.Validate(t.Context(), bmh, bmh.Spec.Image, bmh.Namespace, secretName, secretutils.SecretManager{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -479,7 +479,7 @@ func TestIntegration_ValidateAndExtractCredentials(t *testing.T) {
 	secretManager := secretutils.NewSecretManager(testLogger(t), c, c)
 	validator := NewImageAuthValidator(recorder)
 
-	credentials, err := validator.Validate(t.Context(), bmh, secretManager)
+	credentials, err := validator.Validate(t.Context(), bmh, bmh.Spec.Image, bmh.Namespace, *bmh.Spec.Image.OCIAuthSecretName, secretManager)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

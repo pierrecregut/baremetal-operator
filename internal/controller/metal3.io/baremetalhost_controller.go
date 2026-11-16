@@ -1498,7 +1498,7 @@ func (r *BareMetalHostReconciler) actionProvisioning(ctx context.Context, prov p
 	}
 
 	// Extract OCI auth secret credentials if needed
-	authSecret, err := r.getImageAuthSecret(ctx, info.host, &image)
+	authSecret, err := r.getImageAuthSecret(ctx, info.host, info.hostclaim, &image)
 	if err != nil {
 		var secretErr SecretAccessError
 		if errors.As(err, &secretErr) {
@@ -2680,21 +2680,38 @@ func (r *BareMetalHostReconciler) acquirePreprovisioningNetworkDataSecret(ctx co
 	return secretManager.ObtainSecretWithFinalizer(ctx, key, host.Status.Provisioning.State != metal3api.StateDeleting)
 }
 
+// imageAuthSecretRef resolves the name and namespace of the OCI auth secret to use, preferring the
+// HostClaim's own reference (and namespace) when the host is associated to a HostClaim.
+func imageAuthSecretRef(host *metal3api.BareMetalHost, hostClaim *metal3api.HostClaim, image *metal3api.Image) (name, namespace string) {
+	if hostClaim != nil {
+		if hostClaim.Spec.Image != nil && hostClaim.Spec.Image.OCIAuthSecretName != nil {
+			return *hostClaim.Spec.Image.OCIAuthSecretName, hostClaim.Namespace
+		}
+		return "", ""
+	}
+	if image.OCIAuthSecretName != nil {
+		return *image.OCIAuthSecretName, host.Namespace
+	}
+	return "", ""
+}
+
 // getImageAuthSecret validates and extracts the OCI registry credentials for the image.
 // It returns the base64-encoded credentials in the format expected by Ironic, or an empty
-// string if no auth secret is configured.
-func (r *BareMetalHostReconciler) getImageAuthSecret(ctx context.Context, host *metal3api.BareMetalHost, image *metal3api.Image) (string, error) {
+// string if no auth secret is configured. When hostClaim is non-nil, the secret is looked up in
+// the HostClaim's own namespace, trusting its Spec.Image.OCIAuthSecretName directly.
+func (r *BareMetalHostReconciler) getImageAuthSecret(ctx context.Context, host *metal3api.BareMetalHost, hostClaim *metal3api.HostClaim, image *metal3api.Image) (string, error) {
 	if image == nil || !image.IsOCI() {
 		return "", nil
 	}
 
-	if image.OCIAuthSecretName == nil || *image.OCIAuthSecretName == "" {
+	secretName, secretNamespace := imageAuthSecretRef(host, hostClaim, image)
+	if secretName == "" {
 		return "", nil
 	}
 
 	secretManager := r.secretManager(ctx, r.Log)
 	validator := NewImageAuthValidator(r.Recorder)
-	return validator.Validate(ctx, host, secretManager)
+	return validator.Validate(ctx, host, image, secretNamespace, secretName, secretManager)
 }
 
 func credentialsFromSecret(bmcCredsSecret *corev1.Secret) *bmc.Credentials {

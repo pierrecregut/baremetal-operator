@@ -3916,7 +3916,7 @@ func TestGetImageAuthSecret_OCIImageWithValidSecret(t *testing.T) {
 	r := newTestReconciler(t, host, ociSecret)
 
 	// Manually call getImageAuthSecret to test the function directly
-	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+	credentials, err := r.getImageAuthSecret(t.Context(), host, nil, host.Spec.Image)
 
 	require.NoError(t, err)
 	require.NotEmpty(t, credentials, "expected non-empty credentials")
@@ -3937,7 +3937,7 @@ func TestGetImageAuthSecret_OCIImageWithoutSecret(t *testing.T) {
 
 	r := newTestReconciler(t, host)
 
-	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+	credentials, err := r.getImageAuthSecret(t.Context(), host, nil, host.Spec.Image)
 
 	require.NoError(t, err)
 	assert.Empty(t, credentials, "expected empty credentials when no auth secret is configured")
@@ -3969,7 +3969,7 @@ func TestGetImageAuthSecret_OCIImageWithInvalidSecret(t *testing.T) {
 
 	r := newTestReconciler(t, host, invalidSecret)
 
-	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+	credentials, err := r.getImageAuthSecret(t.Context(), host, nil, host.Spec.Image)
 
 	require.Error(t, err, "expected error for invalid secret")
 	var secretErr SecretAccessError
@@ -3990,7 +3990,7 @@ func TestGetImageAuthSecret_OCIImageWithMissingSecret(t *testing.T) {
 
 	r := newTestReconciler(t, host)
 
-	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+	credentials, err := r.getImageAuthSecret(t.Context(), host, nil, host.Spec.Image)
 
 	require.Error(t, err, "expected error for missing secret")
 	var secretErr SecretAccessError
@@ -4022,7 +4022,7 @@ func TestGetImageAuthSecret_NonOCIImageWithAuthSecret(t *testing.T) {
 
 	r := newTestReconciler(t, host, ociSecret)
 
-	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+	credentials, err := r.getImageAuthSecret(t.Context(), host, nil, host.Spec.Image)
 
 	require.NoError(t, err)
 	assert.Empty(t, credentials, "expected empty credentials for non-OCI image")
@@ -4036,7 +4036,7 @@ func TestGetImageAuthSecret_NilImage(t *testing.T) {
 
 	r := newTestReconciler(t, host)
 
-	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+	credentials, err := r.getImageAuthSecret(t.Context(), host, nil, host.Spec.Image)
 
 	require.NoError(t, err)
 	assert.Empty(t, credentials, "expected empty credentials for nil image")
@@ -4063,12 +4063,60 @@ func TestGetImageAuthSecret_RegistryMismatch(t *testing.T) {
 
 	r := newTestReconciler(t, host, ociSecret)
 
-	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+	credentials, err := r.getImageAuthSecret(t.Context(), host, nil, host.Spec.Image)
 
 	require.Error(t, err, "expected error when registry doesn't match")
 	var secretErr SecretAccessError
 	assert.NotErrorAs(t, err, &secretErr)
 	assert.Empty(t, credentials, "expected empty credentials when registry doesn't match")
+}
+
+// TestGetImageAuthSecret_HostClaimManaged tests that, for a HostClaim-managed host, the auth secret
+// is resolved by name in the HostClaim's own namespace, trusting HostClaim.Spec.Image.OCIAuthSecretName
+// directly rather than the BareMetalHost's.
+func TestGetImageAuthSecret_HostClaimManaged(t *testing.T) {
+	host := newDefaultHost(t)
+	host.Spec.Online = true
+	host.Spec.Image = &metal3api.Image{
+		URL: "oci://registry.example.com/repo/image:tag",
+	}
+
+	ociAuthSecretName := "oci-auth-secret"
+	hostClaimNamespace := "hostclaim-ns"
+	hostClaim := &metal3api.HostClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "claim",
+			Namespace: hostClaimNamespace,
+		},
+		Spec: metal3api.HostClaimSpec{
+			Image: &metal3api.Image{
+				URL:               host.Spec.Image.URL,
+				OCIAuthSecretName: &ociAuthSecretName,
+			},
+		},
+	}
+
+	// A same-named secret in the host's own namespace must be ignored: the HostClaim's namespace
+	// takes precedence, proving the lookup trusts the HostClaim rather than falling back to the host.
+	wrongSecret := createDockerConfigJSONSecretForTest(t, ociAuthSecretName, namespace, map[string]map[string]string{
+		"registry.example.com": {
+			"username": "bad",
+			"password": "bad",
+		},
+	})
+	rightSecret := createDockerConfigJSONSecretForTest(t, ociAuthSecretName, hostClaimNamespace, map[string]map[string]string{
+		"registry.example.com": {
+			"username": "testuser",
+			"password": "testpass",
+		},
+	})
+
+	r := newTestReconciler(t, host, wrongSecret, rightSecret)
+
+	credentials, err := r.getImageAuthSecret(t.Context(), host, hostClaim, host.Spec.Image)
+
+	require.NoError(t, err)
+	assert.Equal(t, "testuser:testpass", credentials)
 }
 
 // Helper function to create a dockerconfigjson secret for testing.
